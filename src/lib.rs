@@ -1,14 +1,55 @@
 use async_trait::async_trait;
-use handlebars::Handlebars;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // Re-export macros from artisan-macros
 pub use artisan_macros::{prompt, schema, tool};
+
+// ============ Error Handling ============
+
+#[derive(Debug, thiserror::Error)]
+pub enum ArtisanError {
+    #[error("API error: {0}")]
+    Api(String),
+
+    #[error("Tool '{tool}' execution failed: {error}")]
+    ToolExecution { tool: String, error: String },
+
+    #[error("Tool '{0}' not found")]
+    ToolNotFound(String),
+
+    #[error("Invalid response format: {0}")]
+    ParseError(String),
+
+    #[error("Failed to render prompt: {0}")]
+    PromptRenderError(String),
+
+    #[error("Rate limit exceeded - waiting would exceed timeout")]
+    RateLimit,
+
+    #[error("Maximum function calls ({0}) exceeded")]
+    MaxFunctionCalls(u32),
+
+    #[error("File operation failed: {0}")]
+    FileOperation(String),
+
+    #[error("Network error: {0}")]
+    Network(#[from] reqwest::Error),
+
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("No response received from model after {0} function calls")]
+    NoResponse(u32),
+}
+
+/// Convenience type alias for Results in this library
+pub type Result<T> = std::result::Result<T, ArtisanError>;
 
 // ============ Core Traits ============
 pub trait IntoPrompt {
@@ -27,68 +68,140 @@ pub trait GeminiSchema {
     fn gemini_schema() -> Value;
 }
 
+// ============ GeminiSchema implementations for base types ============
+
+impl GeminiSchema for String {
+    fn gemini_schema() -> Value {
+        json!({"type": "STRING"})
+    }
+}
+
+impl GeminiSchema for bool {
+    fn gemini_schema() -> Value {
+        json!({"type": "BOOLEAN"})
+    }
+}
+
+impl GeminiSchema for i32 {
+    fn gemini_schema() -> Value {
+        json!({"type": "INTEGER", "format": "int32"})
+    }
+}
+
+impl GeminiSchema for i64 {
+    fn gemini_schema() -> Value {
+        json!({"type": "INTEGER", "format": "int64"})
+    }
+}
+
+impl GeminiSchema for u32 {
+    fn gemini_schema() -> Value {
+        json!({"type": "INTEGER", "format": "int32"})
+    }
+}
+
+impl GeminiSchema for u64 {
+    fn gemini_schema() -> Value {
+        json!({"type": "INTEGER", "format": "int64"})
+    }
+}
+
+impl GeminiSchema for f32 {
+    fn gemini_schema() -> Value {
+        json!({"type": "NUMBER", "format": "float"})
+    }
+}
+
+impl GeminiSchema for f64 {
+    fn gemini_schema() -> Value {
+        json!({"type": "NUMBER", "format": "double"})
+    }
+}
+
+impl<T: GeminiSchema> GeminiSchema for Vec<T> {
+    fn gemini_schema() -> Value {
+        json!({
+            "type": "ARRAY",
+            "items": T::gemini_schema()
+        })
+    }
+}
+
+impl<T: GeminiSchema> GeminiSchema for Option<T> {
+    fn gemini_schema() -> Value {
+        let mut schema = T::gemini_schema();
+        if let Some(obj) = schema.as_object_mut() {
+            obj.insert("nullable".to_string(), json!(true));
+        }
+        schema
+    }
+}
+
+impl GeminiSchema for () {
+    fn gemini_schema() -> Value {
+        json!({"type": "NULL"})
+    }
+}
+
+impl<V: GeminiSchema> GeminiSchema for HashMap<String, V> {
+    fn gemini_schema() -> Value {
+        json!({
+            "type": "OBJECT",
+            "additionalProperties": V::gemini_schema()
+        })
+    }
+}
+
 /// Trait for tools that can be called by Gemini
 #[async_trait]
 pub trait GeminiTool: Send + Sync {
     fn declaration(&self) -> Value;
-    async fn execute(&self, args: Value)
-    -> Result<Value, Box<dyn std::error::Error + Send + Sync>>;
+    async fn execute(
+        &self,
+        args: Value,
+    ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>>;
     fn name(&self) -> &str;
 }
 
 /// A prompt template that transforms Input to Output
 pub struct Prompt<Input, Output> {
-    template: String,
-    input_name: String,
+    template_fn: Box<dyn Fn(&Input) -> String + Send + Sync>,
     _phantom: std::marker::PhantomData<(Input, Output)>,
 }
 
 impl<Input, Output> Prompt<Input, Output> {
-    pub fn new(template: &'static str, input_name: &'static str) -> Self {
+    pub fn new(template_fn: Box<dyn Fn(&Input) -> String + Send + Sync>) -> Self {
         Self {
-            template: template.to_string(),
-            input_name: input_name.to_string(),
+            template_fn,
             _phantom: std::marker::PhantomData,
         }
     }
 
-    pub fn template(&self) -> &str {
-        &self.template
-    }
-    pub fn input_name(&self) -> &str {
-        &self.input_name
+    pub fn render(&self, input: &Input) -> String {
+        (self.template_fn)(input)
     }
 }
 
 // ============ File API Support ============
 
-/// Represents an uploaded file in Gemini
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileHandle {
-    /// The URI of the uploaded file (e.g., "https://generativelanguage.googleapis.com/v1beta/files/...")
     pub uri: String,
-    /// The MIME type of the file
     pub mime_type: String,
-    /// The name of the file (optional)
     pub name: Option<String>,
-    /// The display name for the file (optional)
     pub display_name: Option<String>,
 }
 
 impl FileHandle {
-    /// Create a FileHandle from a Gemini file response
-    fn from_response(
-        response: Value,
-        mime_type: String,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let file = response
-            .get("file")
-            .ok_or("Missing 'file' field in upload response")?;
+    fn from_response(response: Value, mime_type: String) -> Result<Self> {
+        let file = response.get("file").ok_or_else(|| {
+            ArtisanError::ParseError("Missing 'file' field in upload response".to_string())
+        })?;
 
         let uri = file
             .get("uri")
             .and_then(|u| u.as_str())
-            .ok_or("Missing or invalid 'uri' field")?
+            .ok_or_else(|| ArtisanError::ParseError("Missing or invalid 'uri' field".to_string()))?
             .to_string();
 
         let name = file
@@ -166,7 +279,6 @@ impl MultipartFormData {
 
 // ============ Tool Wrapper ============
 
-/// Wrapper that converts async functions into GeminiTool trait implementations
 pub struct ToolWrapper<F, Input, Output> {
     func: F,
     name: String,
@@ -176,7 +288,8 @@ pub struct ToolWrapper<F, Input, Output> {
 impl<F, Input, Output, Fut> ToolWrapper<F, Input, Output>
 where
     F: Fn(Input) -> Fut + Send + Sync,
-    Fut: Future<Output = Result<Output, Box<dyn std::error::Error + Send + Sync>>> + Send,
+    Fut: Future<Output = std::result::Result<Output, Box<dyn std::error::Error + Send + Sync>>>
+        + Send,
     Input: GeminiSchema + for<'de> Deserialize<'de> + Send,
     Output: Serialize,
 {
@@ -193,7 +306,8 @@ where
 impl<F, Input, Output, Fut> GeminiTool for ToolWrapper<F, Input, Output>
 where
     F: Fn(Input) -> Fut + Send + Sync,
-    Fut: Future<Output = Result<Output, Box<dyn std::error::Error + Send + Sync>>> + Send,
+    Fut: Future<Output = std::result::Result<Output, Box<dyn std::error::Error + Send + Sync>>>
+        + Send,
     Input: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync,
     Output: Serialize + Send + Sync,
 {
@@ -213,21 +327,21 @@ where
     async fn execute(
         &self,
         args: Value,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let input: Input = serde_json::from_value(args)?;
         let result = (self.func)(input).await?;
         Ok(serde_json::to_value(result)?)
     }
 }
 
-// Helper function to create tool wrappers more easily
 pub fn tool<F, Input, Output, Fut>(
     name: impl Into<String>,
     func: F,
 ) -> ToolWrapper<F, Input, Output>
 where
     F: Fn(Input) -> Fut + Send + Sync,
-    Fut: Future<Output = Result<Output, Box<dyn std::error::Error + Send + Sync>>> + Send,
+    Fut: Future<Output = std::result::Result<Output, Box<dyn std::error::Error + Send + Sync>>>
+        + Send,
     Input: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync,
     Output: Serialize + Send + Sync,
 {
@@ -236,7 +350,6 @@ where
 
 // ============ Agent Implementation ============
 
-/// The main agent that orchestrates interactions with Gemini
 pub struct Agent {
     api_key: String,
     model: String,
@@ -245,10 +358,10 @@ pub struct Agent {
     client: reqwest::Client,
     last_request: RefCell<Instant>,
     requests_per_second: f64,
+    max_function_calls: u32,
 }
 
 impl Agent {
-    /// Create a new agent with the given API key
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
@@ -258,28 +371,30 @@ impl Agent {
             client: reqwest::Client::new(),
             last_request: RefCell::new(Instant::now() - Duration::from_secs(1)),
             requests_per_second: 2.0,
+            max_function_calls: 10,
         }
     }
 
-    /// Set a system prompt that will be used for all interactions
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = Some(prompt.into());
         self
     }
 
-    /// Set the model to use
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
     }
 
-    /// Set the rate limit for API requests (default: 2 requests per second)
     pub fn with_requests_per_second(mut self, rps: f64) -> Self {
         self.requests_per_second = rps;
         self
     }
 
-    /// Add a persistent tool that will be available for all prompts
+    pub fn with_max_function_calls(mut self, max: u32) -> Self {
+        self.max_function_calls = max;
+        self
+    }
+
     pub fn with_tool<T>(mut self, tool: T) -> Self
     where
         T: IntoTool,
@@ -299,35 +414,27 @@ impl Agent {
         *self.last_request.borrow_mut() = Instant::now();
     }
 
-    /// Upload a file to Gemini
     pub async fn upload_file(
         &self,
         data: &[u8],
         mime_type: impl Into<String>,
-    ) -> Result<FileHandle, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<FileHandle> {
         let mime_type = mime_type.into();
         let display_name = "file";
 
-        // Rate limit the request
         self.wait_if_needed().await;
 
-        // Build multipart form data
         let mut form = MultipartFormData::new();
-
-        // Add metadata
         let metadata = json!({
             "file": {
                 "displayName": display_name
             }
         });
         form.add_json_field("metadata", &metadata);
-
-        // Add file data
         form.add_file_field("file", display_name, &mime_type, data);
 
         let (content_type, body) = form.finish();
 
-        // Make the upload request
         let url =
             "https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=multipart";
 
@@ -342,21 +449,19 @@ impl Agent {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
-            return Err(format!("File upload failed: {}", error_text).into());
+            return Err(ArtisanError::FileOperation(format!(
+                "Upload failed: {}",
+                error_text
+            )));
         }
 
         let response_json: Value = response.json().await?;
         FileHandle::from_response(response_json, mime_type)
     }
 
-    /// Delete an uploaded file
-    pub async fn delete_file(
-        &self,
-        file_handle: &FileHandle,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn delete_file(&self, file_handle: &FileHandle) -> Result<()> {
         self.wait_if_needed().await;
 
-        // Correctly and safely extract the file ID
         let file_id = if let Some(name) = &file_handle.name {
             name.clone()
         } else {
@@ -365,7 +470,9 @@ impl Agent {
                 .split('/')
                 .last()
                 .map(String::from)
-                .ok_or("Cannot extract file name from FileHandle URI")?
+                .ok_or_else(|| {
+                    ArtisanError::FileOperation("Cannot extract file ID from URI".to_string())
+                })?
         };
 
         let url = format!(
@@ -382,14 +489,15 @@ impl Agent {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
-            return Err(format!("Failed to delete file: {}", error_text).into());
+            return Err(ArtisanError::FileOperation(format!(
+                "Delete failed: {}",
+                error_text
+            )));
         }
 
         Ok(())
     }
 
-    /// Start building a prompt execution.
-    /// This method works for prompts defined with or without input arguments.
     pub fn prompt<'a, P>(&'a self, prompt_fn: P) -> PromptBuilder<'a, P::Input, P::Output>
     where
         P: IntoPrompt,
@@ -397,23 +505,19 @@ impl Agent {
         let prompt_data = prompt_fn.into_prompt();
         PromptBuilder {
             agent: self,
-            prompt_template: prompt_data.template().to_string(),
-            input_name: prompt_data.input_name().to_string(),
+            prompt: prompt_data,
             tools: self.persistent_tools.clone(),
             files: Vec::new(),
             retries: 1,
             temperature: None,
             max_tokens: None,
             top_p: None,
+            max_function_calls: None,
             _phantom: std::marker::PhantomData,
         }
     }
 
-    async fn call_gemini(
-        &self,
-        request: Value,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        // Rate limit the request
+    async fn call_gemini(&self, request: Value) -> Result<Value> {
         self.wait_if_needed().await;
 
         let url = format!(
@@ -432,26 +536,25 @@ impl Agent {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
-            return Err(format!("API error: {}", error_text).into());
+            return Err(ArtisanError::Api(error_text));
         }
 
         Ok(response.json().await?)
     }
 }
 
-// ============ PromptBuilder - Fluent API ============
+// ============ PromptBuilder ============
 
-/// Builder for configuring and executing prompts
 pub struct PromptBuilder<'a, Input, Output> {
     agent: &'a Agent,
-    prompt_template: String,
-    input_name: String,
+    prompt: Prompt<Input, Output>,
     tools: Vec<Arc<dyn GeminiTool>>,
     files: Vec<FileHandle>,
     retries: u32,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     top_p: Option<f32>,
+    max_function_calls: Option<u32>,
     _phantom: std::marker::PhantomData<(Input, Output)>,
 }
 
@@ -460,7 +563,6 @@ where
     Input: Serialize + 'static,
     Output: GeminiSchema + for<'de> Deserialize<'de>,
 {
-    /// Add a tool to be available for this specific prompt
     pub fn with_tool<T>(mut self, tool: T) -> Self
     where
         T: IntoTool,
@@ -469,79 +571,57 @@ where
         self
     }
 
-    /// Add a file to be included in this prompt
     pub fn with_file(mut self, file_handle: FileHandle) -> Self {
         self.files.push(file_handle);
         self
     }
 
-    /// Add multiple files to be included in this prompt
     pub fn with_files(mut self, file_handles: Vec<FileHandle>) -> Self {
         self.files.extend(file_handles);
         self
     }
 
-    /// Set the number of retries on failure (default: 1)
     pub fn retries(mut self, n: u32) -> Self {
         self.retries = n;
         self
     }
 
-    /// Set the temperature for response generation (0.0 to 1.0)
     pub fn temperature(mut self, temp: f32) -> Self {
         self.temperature = Some(temp);
         self
     }
 
-    /// Set the maximum number of tokens to generate
     pub fn max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = Some(tokens);
         self
     }
 
-    /// Set the top_p parameter for nucleus sampling
     pub fn top_p(mut self, p: f32) -> Self {
         self.top_p = Some(p);
         self
     }
 
-    /// Execute the prompt with the given input
-    pub async fn invoke(
-        self,
-        input: Input,
-    ) -> Result<Output, Box<dyn std::error::Error + Send + Sync>> {
-        // Render the prompt template with input
-        let rendered_prompt = if std::any::TypeId::of::<Input>() == std::any::TypeId::of::<()>() {
-            // For empty input (unit type), use the template as-is
-            self.prompt_template.clone()
-        } else {
-            // For regular input, render with Handlebars
-            let mut handlebars = Handlebars::new();
-            handlebars.register_escape_fn(handlebars::no_escape);
+    pub fn max_function_calls(mut self, max: u32) -> Self {
+        self.max_function_calls = Some(max);
+        self
+    }
 
-            let input_json = serde_json::to_value(&input)?;
-            handlebars.render_template(
-                &self.prompt_template,
-                &serde_json::json!({ &self.input_name: input_json }),
-            )?
-        };
-
-        // Build the request
+    pub async fn invoke(self, input: Input) -> Result<Output> {
+        let rendered_prompt = self.prompt.render(&input);
         let mut request = self.build_request(rendered_prompt);
 
-        // Try with retries
         let mut last_error = None;
         for attempt in 0..self.retries {
             if attempt > 0 {
-                // Exponential backoff
                 tokio::time::sleep(tokio::time::Duration::from_millis(500 * (attempt as u64)))
                     .await;
             }
 
             match self.execute_with_tools(&mut request).await {
                 Ok(response_text) => {
-                    // Parse the response as Output type
-                    return Ok(serde_json::from_str(&response_text)?);
+                    return serde_json::from_str(&response_text).map_err(|e| {
+                        ArtisanError::ParseError(format!("Failed to parse response: {}", e))
+                    });
                 }
                 Err(e) => {
                     last_error = Some(e);
@@ -549,22 +629,15 @@ where
             }
         }
 
-        Err(last_error.unwrap_or_else(|| "Unknown error".into()))
+        Err(last_error.unwrap_or_else(|| ArtisanError::Api("Unknown error".to_string())))
     }
 
     fn build_request(&self, prompt: String) -> Value {
         let mut contents = vec![];
-
-        // Determine if we're using tools
         let has_tools = !self.tools.is_empty();
 
-        // Build the user prompt
-        let user_prompt = prompt;
+        let mut parts = vec![json!({"text": prompt})];
 
-        // Build parts for the user message
-        let mut parts = vec![json!({"text": user_prompt})];
-
-        // Add file parts if any
         for file in &self.files {
             parts.push(json!({
                 "fileData": {
@@ -588,14 +661,13 @@ where
                 "parts": [{"text": system_prompt}]
             });
         }
-        // Only use structured output when NOT using tools
+
         if !has_tools {
             let mut generation_config = json!({
                 "responseMimeType": "application/json",
                 "responseSchema": Output::gemini_schema()
             });
 
-            // Add optional parameters
             if let Some(temp) = self.temperature {
                 generation_config["temperature"] = json!(temp);
             }
@@ -608,8 +680,6 @@ where
 
             request["generationConfig"] = generation_config;
         } else {
-            // When using tools, we can't use JSON response mode
-            // But we can still set other generation parameters
             let mut generation_config = json!({});
 
             if let Some(temp) = self.temperature {
@@ -626,9 +696,7 @@ where
                 request["generationConfig"] = generation_config;
             }
 
-            // Add tool declarations
             let declarations: Vec<Value> = self.tools.iter().map(|t| t.declaration()).collect();
-            // Just regular tool setup, no JSON instructions
             request["tools"] = json!([{
                 "functionDeclarations": declarations
             }]);
@@ -640,23 +708,29 @@ where
         request
     }
 
-    async fn execute_with_tools(
-        &self,
-        request: &mut Value,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn execute_with_tools(&self, request: &mut Value) -> Result<String> {
         let mut current_request = request.clone();
-        let max_iterations = 10;
+        let max_iterations = self
+            .max_function_calls
+            .unwrap_or(self.agent.max_function_calls);
         let mut final_text_response = None;
+        let mut iterations = 0;
 
-        // Phase 1: Execute tool calls and get the natural language response
-        for _ in 0..max_iterations {
+        loop {
+            if iterations >= max_iterations {
+                return Err(ArtisanError::MaxFunctionCalls(max_iterations));
+            }
+            iterations += 1;
+
             let response = self.agent.call_gemini(current_request.clone()).await?;
 
-            let Some(first_candidate) = response.get("candidates").and_then(|c| c.get(0)) else {
-                return Err("Invalid response format: missing candidates".into());
-            };
+            let first_candidate = response
+                .get("candidates")
+                .and_then(|c| c.get(0))
+                .ok_or_else(|| {
+                    ArtisanError::ParseError("Missing candidates in response".to_string())
+                })?;
 
-            // Check for function calls
             if let Some(parts) = first_candidate["content"]["parts"].as_array() {
                 let mut has_function_call = false;
                 let mut function_responses = vec![];
@@ -664,10 +738,9 @@ where
                 for part in parts {
                     if let Some(function_call) = part.get("functionCall") {
                         has_function_call = true;
-                        // ... execute function (same as your existing code) ...
-                        let name = function_call["name"]
-                            .as_str()
-                            .ok_or("Function call missing name")?;
+                        let name = function_call["name"].as_str().ok_or_else(|| {
+                            ArtisanError::ParseError("Function call missing name".to_string())
+                        })?;
 
                         let default_args = json!({});
                         let args = function_call.get("args").unwrap_or(&default_args);
@@ -676,7 +749,7 @@ where
                             .tools
                             .iter()
                             .find(|t| t.name() == name)
-                            .ok_or_else(|| format!("Unknown tool: {}", name))?;
+                            .ok_or_else(|| ArtisanError::ToolNotFound(name.to_string()))?;
 
                         match tool.execute(args.clone()).await {
                             Ok(result) => {
@@ -690,20 +763,14 @@ where
                                 }));
                             }
                             Err(e) => {
-                                function_responses.push(json!({
-                                    "functionResponse": {
-                                        "name": name,
-                                        "response": {
-                                            "content": json!({
-                                                "error": e.to_string()
-                                            })
-                                        }
-                                    }
-                                }));
+                                // Convert tool errors to our error type
+                                return Err(ArtisanError::ToolExecution {
+                                    tool: name.to_string(),
+                                    error: e.to_string(),
+                                });
                             }
                         }
                     } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        // Capture any text response
                         if !has_function_call {
                             final_text_response = Some(text.to_string());
                         }
@@ -711,7 +778,6 @@ where
                 }
 
                 if has_function_call {
-                    // Continue the conversation with function results
                     let mut messages = current_request["contents"]
                         .as_array()
                         .cloned()
@@ -729,22 +795,20 @@ where
 
                     current_request["contents"] = json!(messages);
                 } else {
-                    // No more function calls, we have our final response
                     break;
                 }
             }
         }
 
-        // Phase 2: Transform the text response into structured output
-        // This happens transparently - the user doesn't know about this second call
         if let Some(text) = final_text_response {
-            // Build a new request specifically for formatting
+            // Phase 2: Format response as JSON
             let format_prompt = format!(
                 "Convert the following information into JSON format matching this schema:\n\n\
-            Schema: {}\n\n\
-            Information to convert:\n{}\n\n\
-            Return ONLY valid JSON, no additional text.",
-                serde_json::to_string_pretty(&Output::gemini_schema()).unwrap(),
+                Schema: {}\n\n\
+                Information to convert:\n{}\n\n\
+                Return ONLY valid JSON, no additional text.",
+                serde_json::to_string_pretty(&Output::gemini_schema())
+                    .map_err(|e| ArtisanError::Json(e))?,
                 text
             );
 
@@ -756,14 +820,13 @@ where
                 "generationConfig": {
                     "responseMimeType": "application/json",
                     "responseSchema": Output::gemini_schema(),
-                    "temperature": 0.1  // Low temperature for consistent formatting
+                    "temperature": 0.1
                 }
             });
 
-            // Make the formatting call
             let format_response = self.agent.call_gemini(format_request).await?;
 
-            if let Some(formatted_text) = format_response
+            format_response
                 .get("candidates")
                 .and_then(|c| c.get(0))
                 .and_then(|c| c.get("content"))
@@ -771,13 +834,14 @@ where
                 .and_then(|p| p.get(0))
                 .and_then(|p| p.get("text"))
                 .and_then(|t| t.as_str())
-            {
-                return Ok(formatted_text.to_string());
-            } else {
-                return Err("Failed to format response as JSON".into());
-            }
+                .map(|s| s.to_string())
+                .ok_or_else(|| {
+                    ArtisanError::ParseError(
+                        "Failed to extract formatted JSON from response".to_string(),
+                    )
+                })
+        } else {
+            Err(ArtisanError::NoResponse(iterations))
         }
-
-        Err("No final response received from model".into())
     }
 }

@@ -3,8 +3,8 @@ extern crate proc_macro;
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    Attribute, Expr, Field, Fields, Ident, ItemFn, ItemStruct, Lit, Meta, ReturnType, Stmt,
-    parse_macro_input,
+    Attribute, Field, Fields, FnArg, Ident, ItemFn, ItemStruct, Lit, Meta, PatIdent, PatType,
+    ReturnType, parse_macro_input,
 };
 
 #[proc_macro_attribute]
@@ -17,18 +17,15 @@ pub fn schema(_attr: TokenStream, item: TokenStream) -> TokenStream {
         syn::parse_quote!(#[derive(serde::Serialize, serde::Deserialize, Debug, Clone, Default)]);
     ast.attrs.push(derives_attr);
 
-    // Generate the impl block AND get a cleaned-up version of the fields
-    // (with the #[gemini] attributes removed)
     let (gemini_schema_impl, cleaned_fields) =
         generate_gemini_schema_impl_and_clean_fields(&name, &ast.fields);
 
-    // Replace the struct's fields with the cleaned version
     if let Fields::Named(ref mut fields) = ast.fields {
         fields.named = cleaned_fields;
     }
 
     let output = quote! {
-        #ast // This now uses the cleaned-up struct
+        #ast
         #gemini_schema_impl
     };
 
@@ -50,7 +47,7 @@ fn generate_gemini_schema_impl_and_clean_fields(
     let mut cleaned_fields = syn::punctuated::Punctuated::new();
 
     let properties_quotes = fields_iter.map(|f| {
-        let mut cleaned_field = f.clone(); // Clone the field to modify it
+        let mut cleaned_field = f.clone();
 
         let field_name = f.ident.as_ref().unwrap();
         let field_name_str = field_name.to_string();
@@ -79,7 +76,6 @@ fn generate_gemini_schema_impl_and_clean_fields(
             None
         });
 
-        // FIX: Remove the `#[gemini(...)]` attribute from the cleaned field
         cleaned_field
             .attrs
             .retain(|attr| !attr.path().is_ident("gemini"));
@@ -95,22 +91,16 @@ fn generate_gemini_schema_impl_and_clean_fields(
             quote! {}
         };
 
-        let type_str = quote!(#field_type).to_string();
-        // Remove whitespace to make string matching reliable
         let type_str = quote!(#field_type).to_string().replace(" ", "");
 
-        // --- REORDERED AND IMPROVED LOGIC ---
         let field_schema_type =
             if type_str.contains("Vec<String>") || type_str.contains("Vec<&str>") {
                 quote! { serde_json::json!({"type": "ARRAY", "items": {"type": "STRING"}}) }
             } else if type_str.contains("Vec<") {
-                // Fallback for other Vec types
                 quote! { serde_json::json!({"type": "ARRAY", "items": {"type": "STRING"}}) }
             } else if type_str.contains("Option<") {
-                // Check for Option before String
                 quote! { serde_json::json!({"type": "STRING", "nullable": true}) }
             } else if type_str.contains("String") {
-                // General String check is now later
                 quote! { serde_json::json!({"type": "STRING"}) }
             } else if type_str.contains("u32") || type_str.contains("i32") {
                 quote! { serde_json::json!({"type": "INTEGER", "format": "int32"}) }
@@ -123,7 +113,6 @@ fn generate_gemini_schema_impl_and_clean_fields(
             } else if type_str.contains("bool") {
                 quote! { serde_json::json!({"type": "BOOLEAN"}) }
             } else {
-                // Default for unknown types
                 quote! { serde_json::json!({"type": "STRING"}) }
             };
 
@@ -162,20 +151,20 @@ pub fn prompt(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let ast = parse_macro_input!(item as ItemFn);
     let fn_name = &ast.sig.ident;
 
-    let (input_name, input_type, fn_args) = if let Some(syn::FnArg::Typed(pt)) =
-        ast.sig.inputs.first()
-    {
-        let name = if let syn::Pat::Ident(pat_ident) = &*pt.pat {
-            pat_ident.ident.to_string()
-        } else {
-            panic!("#[prompt] argument must be a simple identifier (e.g., `req: RecipeRequest`).")
-        };
-        let ty = &pt.ty;
-        (name, quote! { #ty }, quote! { _: #ty })
-    } else {
-        // No arguments case
-        ("".to_string(), quote! { () }, quote! {})
-    };
+    // Parse multiple inputs
+    let inputs: Vec<(String, Box<syn::Type>)> = ast
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| {
+            if let FnArg::Typed(PatType { pat, ty, .. }) = arg {
+                if let syn::Pat::Ident(PatIdent { ident, .. }) = &**pat {
+                    return Some((ident.to_string(), ty.clone()));
+                }
+            }
+            None
+        })
+        .collect();
 
     let output_type = if let ReturnType::Type(_, ty) = &ast.sig.output {
         ty
@@ -183,29 +172,110 @@ pub fn prompt(_attr: TokenStream, item: TokenStream) -> TokenStream {
         panic!("#[prompt] function must have a return type.");
     };
 
-    let template_str = if let Some(Stmt::Expr(Expr::Lit(expr_lit), _)) = ast.block.stmts.first() {
-        if let Lit::Str(lit_str) = &expr_lit.lit {
-            lit_str.value()
-        } else {
-            panic!("#[prompt] function body must be a single string literal.");
-        }
+    // Extract the function body expression
+    let body_expr = &ast.block;
+
+    // Generate wrapper struct if multiple inputs
+    let (input_type, wrapper_struct) = if inputs.is_empty() {
+        (quote! { () }, quote! {})
+    } else if inputs.len() == 1 {
+        let ty = &inputs[0].1;
+        (quote! { #ty }, quote! {})
     } else {
-        panic!("#[prompt] function body must be a single string literal.");
+        let wrapper_name = format_ident!("{}Input", fn_name);
+
+        // Create field definitions for the struct
+        let field_defs: Vec<_> = inputs
+            .iter()
+            .map(|(name, ty)| {
+                let ident = format_ident!("{}", name);
+                quote! { pub #ident: #ty }
+            })
+            .collect();
+
+        // Create schema properties
+        let schema_props: Vec<_> = inputs
+            .iter()
+            .map(|(name, ty)| {
+                let name_str = name.as_str();
+                quote! {
+                    properties.insert(#name_str.to_string(),
+                        <#ty as artisan::GeminiSchema>::gemini_schema());
+                    required.push(#name_str.to_string());
+                }
+            })
+            .collect();
+
+        let wrapper = quote! {
+            #[derive(serde::Serialize, serde::Deserialize, Default)]
+            pub struct #wrapper_name {
+                #(#field_defs),*
+            }
+
+            impl artisan::GeminiSchema for #wrapper_name {
+                fn gemini_schema() -> serde_json::Value {
+                    let mut properties = serde_json::Map::new();
+                    let mut required = vec![];
+
+                    #(#schema_props)*
+
+                    serde_json::json!({
+                        "type": "OBJECT",
+                        "properties": properties,
+                        "required": required
+                    })
+                }
+            }
+        };
+
+        (quote! { #wrapper_name }, wrapper)
     };
 
-    // --- REVISED MACRO OUTPUT ---
+    // Generate the template function
+    let template_fn = if inputs.is_empty() {
+        quote! {
+            Box::new(move |_: &()| -> String {
+                #body_expr
+            })
+        }
+    } else if inputs.len() == 1 {
+        let input_name = format_ident!("{}", inputs[0].0);
+        let input_type_single = &inputs[0].1;
+        quote! {
+            Box::new(move |#input_name: &#input_type_single| -> String {
+                #body_expr
+            })
+        }
+    } else {
+        // For multiple inputs, destructure the wrapper
+        let destructure: Vec<_> = inputs
+            .iter()
+            .map(|(name, _)| {
+                let ident = format_ident!("{}", name);
+                quote! { #ident }
+            })
+            .collect();
+
+        quote! {
+            Box::new(move |input: &#input_type| -> String {
+                let #input_type { #(#destructure),* } = input;
+                #body_expr
+            })
+        }
+    };
+
     let expanded = quote! {
-        // The original function is now just a marker
+        #wrapper_struct
+
         #[allow(non_camel_case_types)]
         pub struct #fn_name;
 
-        // Implement our new trait for this marker struct
         impl artisan::IntoPrompt for #fn_name {
             type Input = #input_type;
             type Output = #output_type;
 
             fn into_prompt(self) -> artisan::Prompt<Self::Input, Self::Output> {
-                 artisan::Prompt::new(#template_str, #input_name)
+                artisan::Prompt::new(#template_fn)
             }
         }
     };
@@ -220,30 +290,113 @@ pub fn tool(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let fn_name_str = fn_name.to_string();
     let fn_name_inner = format_ident!("__{}_impl", fn_name);
 
-    // Get input type from the function signature
-    let input_type = if let Some(syn::FnArg::Typed(pt)) = original_fn.sig.inputs.first() {
-        &pt.ty
+    // Parse multiple inputs
+    let inputs: Vec<(String, Box<syn::Type>)> = original_fn
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| {
+            if let FnArg::Typed(PatType { pat, ty, .. }) = arg {
+                if let syn::Pat::Ident(PatIdent { ident, .. }) = &**pat {
+                    return Some((ident.to_string(), ty.clone()));
+                }
+            }
+            None
+        })
+        .collect();
+
+    // Generate wrapper struct if multiple inputs
+    let (input_type, wrapper_struct, call_expr) = if inputs.is_empty() {
+        panic!("#[tool] function must have at least one argument");
+    } else if inputs.len() == 1 {
+        let ty = &inputs[0].1;
+        let arg_name = format_ident!("{}", inputs[0].0);
+        (
+            quote! { #ty },
+            quote! {},
+            quote! { #fn_name_inner(#arg_name).await },
+        )
     } else {
-        panic!("#[tool] function must have exactly one argument");
+        let wrapper_name = format_ident!("{}Input", fn_name);
+
+        // Create field definitions for the struct
+        let field_defs: Vec<_> = inputs
+            .iter()
+            .map(|(name, ty)| {
+                let ident = format_ident!("{}", name);
+                quote! { pub #ident: #ty }
+            })
+            .collect();
+
+        // Create schema properties
+        let schema_props: Vec<_> = inputs
+            .iter()
+            .map(|(name, ty)| {
+                let name_str = name.as_str();
+                quote! {
+                    properties.insert(#name_str.to_string(),
+                        <#ty as artisan::GeminiSchema>::gemini_schema());
+                    required.push(#name_str.to_string());
+                }
+            })
+            .collect();
+
+        // Create field names for destructuring
+        let field_names: Vec<_> = inputs
+            .iter()
+            .map(|(name, _)| {
+                let ident = format_ident!("{}", name);
+                quote! { #ident }
+            })
+            .collect();
+
+        let wrapper = quote! {
+            #[derive(serde::Serialize, serde::Deserialize)]
+            pub struct #wrapper_name {
+                #(#field_defs),*
+            }
+
+            impl artisan::GeminiSchema for #wrapper_name {
+                fn gemini_schema() -> serde_json::Value {
+                    let mut properties = serde_json::Map::new();
+                    let mut required = vec![];
+
+                    #(#schema_props)*
+
+                    serde_json::json!({
+                        "type": "OBJECT",
+                        "properties": properties,
+                        "required": required
+                    })
+                }
+            }
+        };
+
+        let call = quote! {
+            #fn_name_inner(#(input.#field_names),*).await
+        };
+
+        (quote! { #wrapper_name }, wrapper, call)
     };
 
-    // Rename the original function to avoid conflicts
+    // Clone and modify the inner function
     let mut inner_fn = original_fn.clone();
     inner_fn.sig.ident = fn_name_inner.clone();
-    inner_fn.vis = syn::Visibility::Inherited; // Make it private
+    inner_fn.vis = syn::Visibility::Inherited;
 
     let expanded = quote! {
-        // The actual function implementation (renamed and private)
+        #wrapper_struct
+
         #inner_fn
 
-        // Create a unit struct that will act as our tool marker
         #[allow(non_camel_case_types)]
         pub struct #fn_name;
 
-        // Implement IntoTool for this type
         impl artisan::IntoTool for #fn_name {
             fn into_tool(self) -> Box<dyn artisan::GeminiTool> {
-                Box::new(artisan::tool(#fn_name_str, #fn_name_inner))
+                Box::new(artisan::tool(#fn_name_str, |input: #input_type| async move {
+                    #call_expr
+                }))
             }
         }
     };
