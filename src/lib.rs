@@ -7,13 +7,13 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-// Re-export macros from artisan-macros
-pub use artisan_macros::{prompt, schema, tool};
+// Re-export macros from adamastor-macros
+pub use adamastor_macros::{prompt, schema, tool};
 
 // ============ Error Handling ============
 
 #[derive(Debug, thiserror::Error)]
-pub enum ArtisanError {
+pub enum AdamastorError {
     #[error("API error: {0}")]
     Api(String),
 
@@ -49,7 +49,7 @@ pub enum ArtisanError {
 }
 
 /// Convenience type alias for Results in this library
-pub type Result<T> = std::result::Result<T, ArtisanError>;
+pub type Result<T> = std::result::Result<T, AdamastorError>;
 
 // ============ Core Traits ============
 pub trait IntoPrompt {
@@ -195,13 +195,15 @@ pub struct FileHandle {
 impl FileHandle {
     fn from_response(response: Value, mime_type: String) -> Result<Self> {
         let file = response.get("file").ok_or_else(|| {
-            ArtisanError::ParseError("Missing 'file' field in upload response".to_string())
+            AdamastorError::ParseError("Missing 'file' field in upload response".to_string())
         })?;
 
         let uri = file
             .get("uri")
             .and_then(|u| u.as_str())
-            .ok_or_else(|| ArtisanError::ParseError("Missing or invalid 'uri' field".to_string()))?
+            .ok_or_else(|| {
+                AdamastorError::ParseError("Missing or invalid 'uri' field".to_string())
+            })?
             .to_string();
 
         let name = file
@@ -449,7 +451,7 @@ impl Agent {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
-            return Err(ArtisanError::FileOperation(format!(
+            return Err(AdamastorError::FileOperation(format!(
                 "Upload failed: {}",
                 error_text
             )));
@@ -471,7 +473,7 @@ impl Agent {
                 .last()
                 .map(String::from)
                 .ok_or_else(|| {
-                    ArtisanError::FileOperation("Cannot extract file ID from URI".to_string())
+                    AdamastorError::FileOperation("Cannot extract file ID from URI".to_string())
                 })?
         };
 
@@ -489,7 +491,7 @@ impl Agent {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
-            return Err(ArtisanError::FileOperation(format!(
+            return Err(AdamastorError::FileOperation(format!(
                 "Delete failed: {}",
                 error_text
             )));
@@ -536,7 +538,7 @@ impl Agent {
 
         if !response.status().is_success() {
             let error_text = response.text().await?;
-            return Err(ArtisanError::Api(error_text));
+            return Err(AdamastorError::Api(error_text));
         }
 
         Ok(response.json().await?)
@@ -606,7 +608,14 @@ where
         self
     }
 
-    pub async fn invoke(self, input: Input) -> Result<Output> {
+    pub async fn invoke<Args>(self, args: Args) -> Result<Output>
+    where
+        Input: From<Args>,
+    {
+        // 1. Convert the tuple of arguments into the expected Input struct.
+        let input = Input::from(args);
+
+        // 2. The rest of the function proceeds as before, using the `input` variable.
         let rendered_prompt = self.prompt.render(&input);
         let mut request = self.build_request(rendered_prompt);
 
@@ -620,7 +629,7 @@ where
             match self.execute_with_tools(&mut request).await {
                 Ok(response_text) => {
                     return serde_json::from_str(&response_text).map_err(|e| {
-                        ArtisanError::ParseError(format!("Failed to parse response: {}", e))
+                        AdamastorError::ParseError(format!("Failed to parse response: {}", e))
                     });
                 }
                 Err(e) => {
@@ -629,7 +638,7 @@ where
             }
         }
 
-        Err(last_error.unwrap_or_else(|| ArtisanError::Api("Unknown error".to_string())))
+        Err(last_error.unwrap_or_else(|| AdamastorError::Api("Unknown error".to_string())))
     }
 
     fn build_request(&self, prompt: String) -> Value {
@@ -718,7 +727,7 @@ where
 
         loop {
             if iterations >= max_iterations {
-                return Err(ArtisanError::MaxFunctionCalls(max_iterations));
+                return Err(AdamastorError::MaxFunctionCalls(max_iterations));
             }
             iterations += 1;
 
@@ -728,7 +737,7 @@ where
                 .get("candidates")
                 .and_then(|c| c.get(0))
                 .ok_or_else(|| {
-                    ArtisanError::ParseError("Missing candidates in response".to_string())
+                    AdamastorError::ParseError("Missing candidates in response".to_string())
                 })?;
 
             if let Some(parts) = first_candidate["content"]["parts"].as_array() {
@@ -739,7 +748,7 @@ where
                     if let Some(function_call) = part.get("functionCall") {
                         has_function_call = true;
                         let name = function_call["name"].as_str().ok_or_else(|| {
-                            ArtisanError::ParseError("Function call missing name".to_string())
+                            AdamastorError::ParseError("Function call missing name".to_string())
                         })?;
 
                         let default_args = json!({});
@@ -749,7 +758,7 @@ where
                             .tools
                             .iter()
                             .find(|t| t.name() == name)
-                            .ok_or_else(|| ArtisanError::ToolNotFound(name.to_string()))?;
+                            .ok_or_else(|| AdamastorError::ToolNotFound(name.to_string()))?;
 
                         match tool.execute(args.clone()).await {
                             Ok(result) => {
@@ -764,7 +773,7 @@ where
                             }
                             Err(e) => {
                                 // Convert tool errors to our error type
-                                return Err(ArtisanError::ToolExecution {
+                                return Err(AdamastorError::ToolExecution {
                                     tool: name.to_string(),
                                     error: e.to_string(),
                                 });
@@ -808,7 +817,7 @@ where
                 Information to convert:\n{}\n\n\
                 Return ONLY valid JSON, no additional text.",
                 serde_json::to_string_pretty(&Output::gemini_schema())
-                    .map_err(|e| ArtisanError::Json(e))?,
+                    .map_err(|e| AdamastorError::Json(e))?,
                 text
             );
 
@@ -836,12 +845,213 @@ where
                 .and_then(|t| t.as_str())
                 .map(|s| s.to_string())
                 .ok_or_else(|| {
-                    ArtisanError::ParseError(
+                    AdamastorError::ParseError(
                         "Failed to extract formatted JSON from response".to_string(),
                     )
                 })
         } else {
-            Err(ArtisanError::NoResponse(iterations))
+            Err(AdamastorError::NoResponse(iterations))
         }
+    }
+}
+
+// ============ Embedding Support ============
+
+pub struct SingleEmbedBuilder<'a> {
+    agent: &'a Agent,
+    content: String,
+    is_query: bool,
+    output_dimensionality: Option<u32>,
+}
+
+pub struct BatchEmbedBuilder<'a> {
+    agent: &'a Agent,
+    contents: Vec<String>,
+    is_query: bool,
+    output_dimensionality: Option<u32>,
+}
+
+impl<'a> SingleEmbedBuilder<'a> {
+    fn new(agent: &'a Agent, content: impl Into<String>) -> Self {
+        Self {
+            agent,
+            content: content.into(),
+            is_query: false,
+            output_dimensionality: None,
+        }
+    }
+
+    pub fn as_query(mut self) -> Self {
+        self.is_query = true;
+        self
+    }
+
+    pub fn with_dim(mut self, dim: u32) -> Self {
+        self.output_dimensionality = Some(dim);
+        self
+    }
+
+    pub async fn invoke(self) -> Result<Vec<f32>> {
+        self.agent.wait_if_needed().await;
+
+        let model = "models/text-embedding-004";
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/{}:embedContent",
+            model
+        );
+
+        let mut body = json!({
+            "model": model,
+            "content": {
+                "parts": [{
+                    "text": self.content
+                }]
+            },
+            "taskType": if self.is_query { "RETRIEVAL_QUERY" } else { "RETRIEVAL_DOCUMENT" }
+        });
+
+        if let Some(dim) = self.output_dimensionality {
+            body["outputDimensionality"] = json!(dim);
+        }
+
+        let response = self
+            .agent
+            .client
+            .post(&url)
+            .header("x-goog-api-key", &self.agent.api_key)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            return Err(AdamastorError::Api(format!(
+                "Embedding failed: {}",
+                error_text
+            )));
+        }
+
+        let response_json: Value = response.json().await?;
+
+        response_json
+            .get("embedding")
+            .and_then(|e| e.get("values"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| AdamastorError::ParseError("Missing embedding values".to_string()))?
+            .iter()
+            .map(|v| {
+                v.as_f64()
+                    .map(|f| f as f32)
+                    .ok_or_else(|| AdamastorError::ParseError("Invalid value".to_string()))
+            })
+            .collect()
+    }
+}
+
+impl<'a> BatchEmbedBuilder<'a> {
+    fn new(agent: &'a Agent, contents: &[impl AsRef<str>]) -> Self {
+        Self {
+            agent,
+            contents: contents.iter().map(|s| s.as_ref().to_string()).collect(),
+            is_query: false,
+            output_dimensionality: None,
+        }
+    }
+
+    pub fn as_query(mut self) -> Self {
+        self.is_query = true;
+        self
+    }
+
+    pub fn with_dim(mut self, dim: u32) -> Self {
+        self.output_dimensionality = Some(dim);
+        self
+    }
+
+    pub async fn invoke(self) -> Result<Vec<Vec<f32>>> {
+        self.agent.wait_if_needed().await;
+
+        let model = "models/text-embedding-004";
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/{}:batchEmbedContents",
+            model
+        );
+
+        // Build requests array for batch
+        let requests: Vec<Value> = self
+            .contents
+            .iter()
+            .map(|text| {
+                let mut req = json!({
+                    "model": model,
+                    "content": {
+                        "parts": [{
+                            "text": text
+                        }]
+                    },
+                    "taskType": if self.is_query { "RETRIEVAL_QUERY" } else { "RETRIEVAL_DOCUMENT" }
+                });
+
+                if let Some(dim) = self.output_dimensionality {
+                    req["outputDimensionality"] = json!(dim);
+                }
+                req
+            })
+            .collect();
+
+        let body = json!({
+            "requests": requests
+        });
+
+        let response = self
+            .agent
+            .client
+            .post(&url)
+            .header("x-goog-api-key", &self.agent.api_key)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            return Err(AdamastorError::Api(format!(
+                "Batch embedding failed: {}",
+                error_text
+            )));
+        }
+
+        let response_json: Value = response.json().await?;
+
+        response_json
+            .get("embeddings")
+            .and_then(|e| e.as_array())
+            .ok_or_else(|| AdamastorError::ParseError("Missing embeddings".to_string()))?
+            .iter()
+            .map(|embedding| {
+                embedding
+                    .get("values")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| AdamastorError::ParseError("Missing values".to_string()))?
+                    .iter()
+                    .map(|v| {
+                        v.as_f64()
+                            .map(|f| f as f32)
+                            .ok_or_else(|| AdamastorError::ParseError("Invalid value".to_string()))
+                    })
+                    .collect::<Result<Vec<f32>>>()
+            })
+            .collect()
+    }
+}
+
+impl Agent {
+    pub fn embed(&self, content: impl Into<String>) -> SingleEmbedBuilder {
+        SingleEmbedBuilder::new(self, content)
+    }
+
+    pub fn embed_batch<S: AsRef<str>>(&self, contents: &[S]) -> BatchEmbedBuilder {
+        BatchEmbedBuilder::new(self, contents)
     }
 }
