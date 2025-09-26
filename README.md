@@ -19,8 +19,10 @@ Adamastor provides a type-safe, ergonomic interface for creating prompts, handli
 
 ## Features
 
+- **Flexible prompt system** - Use typed prompts, strings, or closures
 - **Type-safe prompt chaining** - Output of one prompt becomes input to another
 - **Structured schemas** - Define inputs and outputs with automatic JSON schema generation
+- **Schema override** - Change expected output types at runtime
 - **Multiple named inputs** - Prompts and tools can accept multiple typed parameters
 - **Tool integration** - Add custom tools that models can call during execution
 - **Embeddings support** - Generate embeddings for documents and queries
@@ -36,6 +38,8 @@ Add to your `Cargo.toml`:
 [dependencies]
 adamastor = "0.1.0"
 tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 ```
 
 ## Basic Usage
@@ -59,9 +63,7 @@ fn write_poem() -> Poem {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let api_key = std::env::var("GEMINI_API_KEY")
-        .expect("GEMINI_API_KEY not found in environment.");
-
+    let api_key = std::env::var("GEMINI_API_KEY")?;
     let agent = Agent::new(&api_key);
 
     let poem = agent.prompt(write_poem).invoke(()).await?;
@@ -71,105 +73,102 @@ async fn main() -> Result<()> {
 }
 ```
 
-### Using Docstrings for Field Descriptions
+## Flexible Prompt System
 
-The `#[schema]` macro automatically uses doc comments to provide descriptions to the Gemini model, improving its understanding of the desired structure.
+### 1. String Prompts (Ad-hoc)
 
-```rust
-#[schema]
-struct CodeOutput {
-    /// The generated source code, ready to be compiled or executed.
-    code: String,
-
-    /// A step-by-step explanation of how the code works.
-    explanation: String,
-
-    /// A rating of the code's complexity: "simple", "moderate", or "complex".
-    complexity: String,
-}
-```
-
-### Prompts with Input
-
-When a prompt takes a single struct as input, simply pass that struct to the `invoke` method.
+Use simple strings when you need quick, one-off prompts:
 
 ```rust
-#[schema]
-struct CodeRequest {
-    /// The programming language to use (e.g., "Python", "Rust", "JavaScript")
-    language: String,
-
-    /// Detailed description of what the code should accomplish
-    description: String,
-}
-
-#[prompt]
-fn generate_code(req: CodeRequest) -> CodeOutput {
-    format!(
-        "Generate {} code that {}.\n\
-         Include an explanation and rate the complexity.",
-        req.language, req.description
-    )
-}
-
-// Usage
-let request = CodeRequest {
-    language: "Python".to_string(),
-    description: "sorts a list of numbers".to_string(),
-};
-
-let result = agent.prompt(generate_code).invoke(request).await?;
-println!("--- Code ---\n{}\n\n--- Explanation ---\n{}", result.code, result.explanation);
-```
-
-### Multiple Named Inputs for Complex Flows
-
-When a prompt requires multiple distinct inputs, simply pass them as a tuple to the `invoke` method. Adamastor handles the bundling behind the scenes.
-
-```rust
-use std::collections::HashMap;
-
-#[schema]
-struct Document {
-    content: String,
-    metadata: HashMap<String, String>,
-}
-
-#[schema]
-struct Analysis {
-    comparison: String,
-    similarities: Vec<String>,
-    differences: Vec<String>,
-}
-
-// This prompt takes two Documents and a focus String
-#[prompt]
-fn compare_documents(doc1: Document, doc2: Document, focus: String) -> Analysis {
-    format!(
-        "Compare these documents focusing on {}:\n\n\
-         Doc1: {}\n\n\
-         Doc2: {}\n",
-        focus, doc1.content, doc2.content
-    )
-}
-
-// Usage
-let doc1 = Document { content: "Rust uses a borrow checker for memory safety.".to_string(), ..Default::default() };
-let doc2 = Document { content: "Go uses a garbage collector for memory management.".to_string(), ..Default::default() };
-let focus = "memory management approach".to_string();
-
-// Pass the arguments in a tuple
-let analysis = agent
-    .prompt(compare_documents)
-    .invoke((doc1, doc2, focus))
+// Type inference from variable annotation
+let recipe: Recipe = agent
+    .prompt("Create a recipe for chocolate chip cookies")
+    .invoke()
     .await?;
 
-println!("Comparison: {}", analysis.comparison);
+// Turbofish syntax
+let haiku = agent
+    .prompt("Write a haiku about the ocean")
+    .invoke::<Haiku>()
+    .await?;
+
+// Explicit schema with .returns()
+let doc = agent
+    .prompt("Write technical documentation about REST APIs")
+    .returns::<TechnicalDoc>()
+    .temperature(0.7)
+    .invoke(())
+    .await?;
 ```
 
-### Prompt Chaining - The Core Pattern
+### 2. Closure Prompts (Dynamic)
 
-The real power of Adamastor is type-safe prompt chaining. The output struct of one prompt can be the input of another, creating complex, multi-step agents that are easy to reason about.
+Generate prompts dynamically with closures that capture context:
+
+```rust
+let cuisine = "Italian";
+let recipe = agent
+    .prompt(|| format!("Create a traditional {} recipe", cuisine))
+    .invoke::<Recipe>()
+    .await?;
+
+// Capturing multiple variables
+let ingredient = "tomatoes";
+let season = "summer";
+let dish = agent
+    .prompt(|| {
+        format!("Create a {} recipe featuring {} as the main ingredient",
+            season, ingredient)
+    })
+    .invoke::<SimpleRecipe>()
+    .await?;
+```
+
+### 3. Typed Prompts (Best for Chaining)
+
+Define reusable, type-safe prompts with the `#[prompt]` macro:
+
+```rust
+#[prompt]
+fn generate_code(req: CodeRequest) -> CodeOutput {
+    format!("Generate {} code that {}", req.language, req.description)
+}
+
+let result = agent
+    .prompt(generate_code)
+    .invoke(CodeRequest {
+        language: "Python".to_string(),
+        description: "sorts a list".to_string(),
+    })
+    .await?;
+```
+
+## Schema Override
+
+Change the expected output type of any prompt:
+
+```rust
+// Override a typed prompt's output
+let simple_version = agent
+    .prompt(write_article)           // Normally returns Article
+    .returns::<SimpleRecipe>()       // Override to return SimpleRecipe
+    .invoke("pasta carbonara".to_string())
+    .await?;
+
+// Make a string prompt chainable by specifying its type
+let typed_for_chain = agent
+    .prompt("Extract key points about async programming")
+    .returns::<Article>()             // Now it can be chained!
+    .temperature(0.5)
+    .invoke(())
+    .await?;
+```
+
+## Prompt Chaining
+
+### Typed Prompt Chaining
+
+Chain typed prompts for complex, multi-step operations:
 
 ```rust
 #[schema]
@@ -191,267 +190,256 @@ struct StudyGuide {
     key_concepts: Vec<String>,
 }
 
-// First prompt: Generate an article from a topic
 #[prompt]
 fn write_article(topic: String) -> Article {
     format!("Write a detailed article about {}", topic)
 }
 
-// Second prompt: Takes the entire Article struct as input, outputs a Summary
 #[prompt]
 fn summarize(article: Article) -> Summary {
-    format!(
-        "Summarize this article:\nTitle: {}\nContent: {}",
-        article.title, article.content
-    )
+    format!("Summarize this article: {}", article.title)
 }
 
-// Third prompt: Takes the Summary as input, outputs a StudyGuide
 #[prompt]
 fn create_study_guide(summary: Summary) -> StudyGuide {
-    format!(
-        "Create a study guide based on this summary:\nOne-liner: {}\nTopics: {:?}",
-        summary.one_line, summary.main_topics
-    )
+    format!("Create a study guide from: {}", summary.one_line)
 }
 
-// Chain them together with compile-time type safety
-let article = agent
+// Chain with .then() method
+let guide = agent
     .prompt(write_article)
-    .invoke("Rust's ownership model".to_string())
+    .then(summarize)
+    .then(create_study_guide)
+    .invoke("Design patterns in Rust".to_string())
+    .await?;
+```
+
+### Mixed Chaining
+
+Start with strings, add types, then chain:
+
+```rust
+// String → Typed → Typed
+let article = agent
+    .prompt("Write about the benefits of static typing")
+    .returns::<Article>()        // Specify type for string prompt
+    .invoke(())
     .await?;
 
 let summary = agent
-    .prompt(summarize)
-    .invoke(article)  // The `Article` output flows directly into the next prompt
+    .prompt(summarize)           // Use typed prompt
+    .invoke(article)
     .await?;
 
-let study_guide = agent
-    .prompt(create_study_guide)
-    .invoke(summary)  // The `Summary` output flows into the final prompt
+let guide = agent
+    .prompt(create_study_guide)  // Chain another typed prompt
+    .invoke(summary)
     .await?;
-
-println!("Study Guide Questions: {:#?}", study_guide.questions);
 ```
 
-### Primitive Return Types
+## Multiple Named Inputs
 
-You can use Rust primitive types directly as inputs and outputs without needing the `#[schema]` macro.
+Prompts can accept multiple distinct inputs:
+
+```rust
+#[schema]
+struct Document {
+    content: String,
+    metadata: HashMap<String, String>,
+}
+
+#[schema]
+struct Analysis {
+    comparison: String,
+    similarities: Vec<String>,
+    differences: Vec<String>,
+}
+
+#[prompt]
+fn compare_documents(doc1: Document, doc2: Document, focus: String) -> Analysis {
+    format!("Compare these documents focusing on {}", focus)
+}
+
+// Pass multiple arguments as a tuple
+let analysis = agent
+    .prompt(compare_documents)
+    .invoke((doc1, doc2, "writing style".to_string()))
+    .await?;
+```
+
+## Primitive Types
+
+Use Rust primitive types directly without needing the `#[schema]` macro:
 
 ```rust
 #[prompt]
 fn calculate_sum(numbers: Vec<i32>) -> f64 {
-    format!("Calculate the sum of these numbers: {:?}", numbers)
+    format!("Calculate the sum of: {:?}", numbers)
 }
 
 #[prompt]
 fn get_word_count(text: String) -> u32 {
-    format!("Count the words in this text: {}", text)
+    format!("Count words in: {}", text)
 }
 
 #[prompt]
-fn check_validity(data: String) -> bool {
+fn is_valid_json(data: String) -> bool {
     format!("Is this valid JSON: {}", data)
+}
+
+// Usage
+let sum = agent.prompt(calculate_sum).invoke(vec![1, 2, 3]).await?;
+let count = agent.prompt(get_word_count).invoke("Hello world".to_string()).await?;
+let valid = agent.prompt(is_valid_json).invoke("{}".to_string()).await?;
+```
+
+## Using Docstrings
+
+Doc comments are automatically used as field descriptions:
+
+```rust
+#[schema]
+struct CodeOutput {
+    /// The generated source code, ready to compile
+    code: String,
+
+    /// Step-by-step explanation of the code
+    explanation: String,
+
+    /// Complexity rating: "simple", "moderate", or "complex"
+    complexity: String,
 }
 ```
 
 ## Embeddings
 
-Adamastor provides powerful embedding capabilities for semantic search, similarity comparisons, and RAG applications.
+Generate embeddings for semantic search and RAG:
 
 ```rust
-// Single document embedding (default: for retrieval storage)
-let embedding: Vec<f32> = agent
-    .embed("This is my document content.")
+// Single document embedding
+let embedding = agent
+    .embed("Document content")
     .invoke()
     .await?;
 
-// Batch embeddings for multiple documents
-let embeddings: Vec<Vec<f32>> = agent
-    .embed_batch(&["First document", "Second document", "Third document"])
+// Batch embeddings
+let embeddings = agent
+    .embed_batch(&["Doc 1", "Doc 2", "Doc 3"])
     .invoke()
     .await?;
 
-// Query embedding (optimized for search queries)
-let query_embedding: Vec<f32> = agent
+// Query embedding (optimized for search)
+let query_embedding = agent
     .embed("What is the meaning of life?")
     .as_query()
     .invoke()
     .await?;
 
-// Reduced dimensionality (saves storage and bandwidth)
-let compact_embedding: Vec<f32> = agent
-    .embed("Large text to embed...")
-    .with_dim(768)  // Options: 768, 1536, or 3072 (default)
+// Reduced dimensionality
+let compact = agent
+    .embed("Large text...")
+    .with_dim(768)  // 768, 1536, or 3072 (default)
     .invoke()
     .await?;
 ```
 
-### Embedding Example: Semantic Search
-
-```rust
-use adamastor::{Agent, Result};
-
-async fn semantic_search(
-    agent: &Agent,
-    documents: &[String],
-    query: &str,
-) -> Result<Vec<(usize, f32)>> {
-    let doc_embeddings = agent.embed_batch(documents).invoke().await?;
-    let query_embedding = agent.embed(query).as_query().invoke().await?;
-
-    let mut similarities: Vec<(usize, f32)> = doc_embeddings
-        .iter()
-        .enumerate()
-        .map(|(idx, doc_emb)| (idx, cosine_similarity(&query_embedding, doc_emb)))
-        .collect();
-
-    similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    Ok(similarities)
-}
-
-fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
-    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
-    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    dot / (norm_a * norm_b)
-}
-```
-
-## Advanced Usage with Tools
+## Tools
 
 ### Defining Tools
 
-Tools are async functions that the model can call to interact with external systems. Use the `#[tool]` macro and provide clear doc comments.
-
 ```rust
-use std::error::Error;
-
 #[schema]
 struct WebQuery {
-    /// The specific search query string.
+    /// The search query string
     query: String,
-    /// Maximum number of search results to return.
+    /// Maximum results to return
     max_results: u32,
 }
 
 #[tool]
 async fn search_web(input: WebQuery) -> Result<String, Box<dyn Error + Send + Sync>> {
-    // In a real application, you would call a search engine API here.
-    Ok(format!("Found {} results for: '{}'", input.max_results, input.query))
+    Ok(format!("Found {} results for '{}'", input.max_results, input.query))
 }
-```
 
-### Tools with Multiple Parameters
-
-Just like with prompts, if a tool has multiple arguments, they will be bundled automatically. The calling convention from the agent's perspective remains the same.
-
-```rust
+// Tools with multiple parameters
 #[tool]
 async fn database_query(
     table: String,
     columns: Vec<String>,
     limit: u32,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    // In a real application, you would connect to a database here.
-    Ok(format!(
-        "SELECT {} FROM {} LIMIT {}",
-        columns.join(", "),
-        table,
-        limit
-    ))
+    Ok(format!("SELECT {} FROM {} LIMIT {}",
+        columns.join(", "), table, limit))
 }
 ```
 
-### Using Tools in Prompts
-
-You can add tools to a specific prompt execution or configure an agent with persistent tools that are always available.
+### Using Tools
 
 ```rust
-// Add tools to a specific prompt
+// Add tools to specific prompts
 let result = agent
     .prompt(solve_problem)
-    .with_tool(calculator)
     .with_tool(search_web)
+    .with_tool(calculator)
     .invoke(input)
     .await?;
 
-// Or, create an agent with persistent tools
+// Or create an agent with persistent tools
 let agent = Agent::new(&api_key)
     .with_tool(calculator)
     .with_tool(search_web);
-
-// Now all prompts on this agent can use these tools by default.
 ```
 
-## Configuration Reference
+## Configuration
 
 ### Agent Configuration
 
 ```rust
 let agent = Agent::new(&api_key)
-    // Model to use, e.g., "gemini-1.5-flash", "gemini-1.5-pro".
-    .with_model("gemini-2.5-flash")
-    // A system prompt sets a consistent role or behavior.
-    .with_system_prompt("You are a helpful coding assistant.")
-    // Adjust requests per second to stay within API limits (default: 2.0).
+    .with_model("gemini-2.0-flash")
+    .with_system_prompt("You are a helpful assistant")
     .with_requests_per_second(3.0)
-    // Prevent infinite loops in tool usage (default: 10).
     .with_max_function_calls(15)
-    // Add persistent tools available to all prompts.
     .with_tool(calculator);
 ```
 
 ### Prompt Configuration
 
-Fine-tune individual prompt executions by chaining methods.
-
 ```rust
 let result = agent
     .prompt(my_prompt)
-    // Controls randomness (0.0 = deterministic, 1.0 = creative).
-    .temperature(0.8)
-    // Limits response length to control costs and size.
-    .max_tokens(500)
-    // An alternative to temperature for sampling.
-    .top_p(0.95)
-    // Number of retries on transient failures (default: 1, no retries).
-    .retries(3)
-    // Override the agent's default max function calls.
-    .max_function_calls(20)
-    // Add tools specific to this prompt run.
-    .with_tool(special_tool)
-    // Attach files for multimodal input.
-    .with_file(file_handle)
+    .temperature(0.8)           // Randomness (0.0-1.0)
+    .max_tokens(500)            // Response length limit
+    .top_p(0.95)               // Alternative to temperature
+    .retries(3)                // Retry on failure
+    .max_function_calls(20)    // Tool call limit
+    .with_tool(special_tool)   // Add tool for this prompt
+    .with_file(file_handle)    // Attach files
     .invoke(input)
     .await?;
 ```
 
 ## File Handling
 
-Upload files to use with multimodal prompts.
-
 ```rust
-// Upload file contents and get a handle
-let file_data = std::fs::read("my_document.txt")?;
+// Upload file
+let file_data = std::fs::read("document.txt")?;
 let file_handle = agent
     .upload_file(&file_data, "text/plain")
     .await?;
 
-// Use the handle in a prompt
+// Use in prompt
 let result = agent
     .prompt(analyze_document)
     .with_file(file_handle.clone())
-    .invoke("Summarize this file.".to_string())
+    .invoke("Summarize this file")
     .await?;
 
-// Clean up the file from the server
+// Clean up
 agent.delete_file(&file_handle).await?;
 ```
 
 ## Error Handling
-
-Adamastor provides specific error types for robust error handling.
 
 ```rust
 use adamastor::{AdamastorError, Result};
@@ -459,17 +447,69 @@ use adamastor::{AdamastorError, Result};
 match agent.prompt(my_prompt).invoke(input).await {
     Ok(result) => println!("Success: {:?}", result),
     Err(AdamastorError::ToolNotFound(name)) => {
-        eprintln!("Error: Tool '{}' was called but not found.", name)
+        eprintln!("Tool '{}' not found", name)
     },
     Err(AdamastorError::MaxFunctionCalls(max)) => {
-        eprintln!("Error: Exceeded the limit of {} function calls.", max)
+        eprintln!("Exceeded {} function calls", max)
     },
     Err(AdamastorError::RateLimit) => {
-        eprintln!("Error: Rate limit exceeded. Try again later.")
+        eprintln!("Rate limit exceeded")
     },
-    Err(AdamastorError::Api(msg)) => {
-        eprintln!("Error: An API error occurred: {}", msg)
-    },
-    Err(e) => eprintln!("An unexpected error occurred: {}", e),
+    Err(e) => eprintln!("Error: {}", e),
 }
 ```
+
+## Complete Example
+
+```rust
+use adamastor::{Agent, prompt, schema, Result};
+use std::collections::HashMap;
+
+#[schema]
+struct Recipe {
+    name: String,
+    ingredients: Vec<String>,
+    instructions: Vec<String>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let agent = Agent::new(std::env::var("GEMINI_API_KEY")?)
+        .with_model("gemini-2.0-flash");
+
+    // 1. Simple string prompt
+    let recipe: Recipe = agent
+        .prompt("Create a healthy breakfast recipe")
+        .temperature(0.7)
+        .invoke()
+        .await?;
+
+    println!("Recipe: {}", recipe.name);
+
+    // 2. Dynamic prompt with closure
+    let meal_type = "dinner";
+    let recipe = agent
+        .prompt(|| format!("Create a quick {} recipe", meal_type))
+        .invoke::<Recipe>()
+        .await?;
+
+    // 3. Typed prompt with chaining
+    #[prompt]
+    fn improve_recipe(recipe: Recipe) -> Recipe {
+        format!("Make this recipe healthier: {}", recipe.name)
+    }
+
+    let improved = agent
+        .prompt(improve_recipe)
+        .invoke(recipe)
+        .await?;
+
+    println!("Improved: {}", improved.name);
+
+    Ok(())
+}
+```
+
+## License
+
+MIT
