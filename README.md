@@ -13,17 +13,15 @@
 </div>
 
 <div align="right">
-    «Eu sou aquele oculto e grande Cabo
-A quem chamais vós outros Tormentório,
-Que nunca a Ptolomeu, Pompónio, Estrabo,
-Plínio e quantos passaram fui notório.
-Aqui toda a Africana costa acabo
-Neste meu nunca visto Promontório,
-Que pera o Pólo Antártico se estende,
-A quem vossa ousadia tanto ofende.
-    </div>
-
-#
+    <i>«Eu sou aquele oculto e grande Cabo<br>
+A quem chamais vós outros Tormentório,<br>
+Que nunca a Ptolomeu, Pompónio, Estrabo,<br>
+Plínio e quantos passaram fui notório.<br>
+Aqui toda a Africana costa acabo<br>
+Neste meu nunca visto Promontório,<br>
+Que pera o Pólo Antártico se estende,<br>
+A quem vossa ousadia tanto ofende.<br>
+    </i></div>
 
 ## Features
 
