@@ -38,8 +38,6 @@ Add to your `Cargo.toml`:
 [dependencies]
 adamastor = "0.1.0"
 tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 ```
 
 ## Basic Usage
@@ -101,14 +99,14 @@ let doc = agent
     .await?;
 ```
 
-### 2. Closure Prompts (Dynamic)
+### 2. On-the-fly Prompts
 
-Generate prompts dynamically with closures that capture context:
+Generate prompts on-the-fly with strings that capture context:
 
 ```rust
 let cuisine = "Italian";
 let recipe = agent
-    .prompt(|| format!("Create a traditional {} recipe", cuisine))
+    .prompt(format!("Create a traditional {} recipe", cuisine))
     .invoke::<Recipe>()
     .await?;
 
@@ -116,10 +114,10 @@ let recipe = agent
 let ingredient = "tomatoes";
 let season = "summer";
 let dish = agent
-    .prompt(|| {
+    .prompt(
         format!("Create a {} recipe featuring {} as the main ingredient",
             season, ingredient)
-    })
+    )
     .invoke::<SimpleRecipe>()
     .await?;
 ```
