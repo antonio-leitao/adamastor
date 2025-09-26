@@ -4,18 +4,26 @@
 
 <div align="center">
 <h3 max-width='200px' align="center">Adamastor</h3>
-  <p><i>Permutation Based Approximate Nearest Neighbors<br/>
-  No index, infinitely incrementable<br/>
+  <p><i>Rust framework for building LLM Agents<br/>
+  Type-safe for creating structured adn reliable prompts<br/>
   Built with Rust</i><br/></p>
   <!-- <p> -->
 <!-- <img alt="Pepy Total Downlods" src="https://img.shields.io/pepy/dt/caravela?style=for-the-badge&logo=python&labelColor=white&color=blue"> -->
   <!-- </p> -->
 </div>
 
-#
+<div align="right">
+    «Eu sou aquele oculto e grande Cabo
+A quem chamais vós outros Tormentório,
+Que nunca a Ptolomeu, Pompónio, Estrabo,
+Plínio e quantos passaram fui notório.
+Aqui toda a Africana costa acabo
+Neste meu nunca visto Promontório,
+Que pera o Pólo Antártico se estende,
+A quem vossa ousadia tanto ofende.
+    </div>
 
-A Rust framework for building AI agents with the Gemini API.
-Adamastor provides a type-safe, ergonomic interface for creating prompts, handling structured data, embeddings, and integrating tools with Gemini models.
+#
 
 ## Features
 
