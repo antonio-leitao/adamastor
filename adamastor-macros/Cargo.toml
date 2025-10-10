@@ -1,11 +1,11 @@
 [package]
 name = "adamastor-macros"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
-repository.workspace = true
-authors.workspace = true
+version = { workspace = true }
+edition = "2021"
+license = "MIT"
 description = "Procedural macros for the Adamastor LLM framework"
+repository = "https://github.com/antonio-leitao/adamastor"
+authors = ["Your Name <leitaoto@gmail.com>"]
 
 [lib]
 proc-macro = true
