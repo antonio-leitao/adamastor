@@ -1,15 +1,13 @@
-use async_trait::async_trait;
-use futures::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
-use std::future::Future;
+use std::any::TypeId;
+use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-// Re-export macros from adamastor-macros
-pub use adamastor_macros::{prompt, schema, tool};
+pub use adamastor_macros::schema;
 
 // ============ Error Handling ============
 
@@ -18,26 +16,8 @@ pub enum AdamastorError {
     #[error("API error: {0}")]
     Api(String),
 
-    #[error("Tool '{tool}' execution failed: {error}")]
-    ToolExecution { tool: String, error: String },
-
-    #[error("Tool '{0}' not found")]
-    ToolNotFound(String),
-
-    #[error("Invalid response format: {0}")]
+    #[error("Failed to parse response: {0}")]
     ParseError(String),
-
-    #[error("Failed to render prompt: {0}")]
-    PromptRenderError(String),
-
-    #[error("Rate limit exceeded - waiting would exceed timeout")]
-    RateLimit,
-
-    #[error("Maximum function calls ({0}) exceeded")]
-    MaxFunctionCalls(u32),
-
-    #[error("File operation failed: {0}")]
-    FileOperation(String),
 
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
@@ -45,32 +25,20 @@ pub enum AdamastorError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("No response received from model after {0} function calls")]
-    NoResponse(u32),
+    #[error("File operation failed: {0}")]
+    FileOperation(String),
 }
 
-/// Convenience type alias for Results in this library
 pub type Result<T> = std::result::Result<T, AdamastorError>;
 
-// ============ Core Traits ============
-pub trait IntoPrompt {
-    type Input: Serialize + Default;
-    type Output: GeminiSchema + for<'de> Deserialize<'de>;
-    fn into_prompt(self) -> Prompt<Self::Input, Self::Output>;
-}
+// ============ GeminiSchema Trait ============
 
-/// Trait for types that can be converted into tools
-pub trait IntoTool {
-    fn into_tool(self) -> Box<dyn GeminiTool>;
-}
-
-/// Trait for types that can generate Gemini schemas
+/// Trait for types that can generate Gemini JSON schemas
 pub trait GeminiSchema {
     fn gemini_schema() -> Value;
 }
 
-// ============ GeminiSchema implementations for base types ============
-
+// String is special - it means unstructured text response
 impl GeminiSchema for String {
     fn gemini_schema() -> Value {
         json!({"type": "STRING"})
@@ -138,61 +106,7 @@ impl<T: GeminiSchema> GeminiSchema for Option<T> {
     }
 }
 
-impl GeminiSchema for () {
-    fn gemini_schema() -> Value {
-        json!({"type": "NULL"})
-    }
-}
-
-impl<V: GeminiSchema> GeminiSchema for HashMap<String, V> {
-    fn gemini_schema() -> Value {
-        json!({
-            "type": "OBJECT",
-            "additionalProperties": V::gemini_schema()
-        })
-    }
-}
-
-/// Trait for tools that can be called by Gemini
-#[async_trait]
-pub trait GeminiTool: Send + Sync {
-    fn declaration(&self) -> Value;
-    async fn execute(
-        &self,
-        args: Value,
-    ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>>;
-    fn name(&self) -> &str;
-}
-
-/// A prompt template that transforms Input to Output
-pub struct Prompt<Input, Output> {
-    template_fn: Arc<dyn Fn(&Input) -> String + Send + Sync>,
-    _phantom: PhantomData<(Input, Output)>,
-}
-
-impl<Input, Output> Clone for Prompt<Input, Output> {
-    fn clone(&self) -> Self {
-        Self {
-            template_fn: self.template_fn.clone(),
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<Input, Output> Prompt<Input, Output> {
-    pub fn new(template_fn: Box<dyn Fn(&Input) -> String + Send + Sync>) -> Self {
-        Self {
-            template_fn: Arc::from(template_fn),
-            _phantom: PhantomData,
-        }
-    }
-
-    pub fn render(&self, input: &Input) -> String {
-        (self.template_fn)(input)
-    }
-}
-
-// ============ File API Support ============
+// ============ File Handling ============
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileHandle {
@@ -235,7 +149,6 @@ impl FileHandle {
     }
 }
 
-/// Helper struct for building multipart form data
 struct MultipartFormData {
     boundary: String,
     body: Vec<u8>,
@@ -289,186 +202,93 @@ impl MultipartFormData {
     }
 }
 
-// ============ Tool Wrapper ============
+// ============ Rate Limiting ============
 
-pub struct ToolWrapper<F, Input, Output> {
-    func: F,
-    name: String,
-    _phantom: PhantomData<(Input, Output)>,
+struct RateLimiter {
+    min_interval: Duration,
+    last_request: Mutex<Instant>,
 }
 
-impl<F, Input, Output, Fut> ToolWrapper<F, Input, Output>
-where
-    F: Fn(Input) -> Fut + Send + Sync,
-    Fut: Future<Output = std::result::Result<Output, Box<dyn std::error::Error + Send + Sync>>>
-        + Send,
-    Input: GeminiSchema + for<'de> Deserialize<'de> + Send,
-    Output: Serialize,
-{
-    pub fn new(name: impl Into<String>, func: F) -> Self {
+impl RateLimiter {
+    fn new(requests_per_second: f64) -> Self {
         Self {
-            func,
-            name: name.into(),
-            _phantom: PhantomData,
+            min_interval: Duration::from_secs_f64(1.0 / requests_per_second),
+            last_request: Mutex::new(Instant::now() - Duration::from_secs(1)),
         }
     }
-}
 
-#[async_trait]
-impl<F, Input, Output, Fut> GeminiTool for ToolWrapper<F, Input, Output>
-where
-    F: Fn(Input) -> Fut + Send + Sync,
-    Fut: Future<Output = std::result::Result<Output, Box<dyn std::error::Error + Send + Sync>>>
-        + Send,
-    Input: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync,
-    Output: Serialize + Send + Sync,
-{
-    fn name(&self) -> &str {
-        &self.name
-    }
+    async fn wait(&self) {
+        let elapsed = {
+            let last = self.last_request.lock().unwrap();
+            last.elapsed()
+        };
 
-    fn declaration(&self) -> Value {
-        let schema = Input::gemini_schema();
-        json!({
-            "name": self.name,
-            "description": format!("Function {}", self.name),
-            "parameters": schema
-        })
-    }
-
-    async fn execute(
-        &self,
-        args: Value,
-    ) -> std::result::Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let input: Input = serde_json::from_value(args)?;
-        let result = (self.func)(input).await?;
-        Ok(serde_json::to_value(result)?)
-    }
-}
-
-pub fn tool<F, Input, Output, Fut>(
-    name: impl Into<String>,
-    func: F,
-) -> ToolWrapper<F, Input, Output>
-where
-    F: Fn(Input) -> Fut + Send + Sync,
-    Fut: Future<Output = std::result::Result<Output, Box<dyn std::error::Error + Send + Sync>>>
-        + Send,
-    Input: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync,
-    Output: Serialize + Send + Sync,
-{
-    ToolWrapper::new(name, func)
-}
-
-// ============ Builder Abstraction ============
-
-pub trait Promptable<'a> {
-    type Builder;
-    fn into_builder(self, agent: &'a Agent) -> Self::Builder;
-}
-
-impl<'a, P> Promptable<'a> for P
-where
-    P: IntoPrompt,
-{
-    type Builder = PromptBuilder<'a, P::Input, P::Output>;
-
-    fn into_builder(self, agent: &'a Agent) -> Self::Builder {
-        let prompt_data = self.into_prompt();
-        PromptBuilder {
-            agent,
-            prompt: prompt_data,
-            settings: BuilderSettings::new(agent),
-            _phantom: PhantomData,
+        if elapsed < self.min_interval {
+            tokio::time::sleep(self.min_interval - elapsed).await;
         }
+
+        *self.last_request.lock().unwrap() = Instant::now();
     }
 }
 
-impl<'a> Promptable<'a> for &'a str {
-    type Builder = UntypedPromptBuilder<'a>;
-    fn into_builder(self, agent: &'a Agent) -> Self::Builder {
-        UntypedPromptBuilder::new(agent, self)
-    }
-}
+// ============ Agent ============
 
-impl<'a> Promptable<'a> for String {
-    type Builder = UntypedPromptBuilder<'a>;
-    fn into_builder(self, agent: &'a Agent) -> Self::Builder {
-        UntypedPromptBuilder::new(agent, self)
-    }
-}
-
-// ============ Agent Implementation ============
-
+/// Main agent for stateless prompt execution
 pub struct Agent {
     api_key: String,
     model: String,
     system_prompt: Option<String>,
-    persistent_tools: Vec<Arc<dyn GeminiTool>>,
     client: reqwest::Client,
-    last_request: Mutex<Instant>,
-    requests_per_second: f64,
-    max_function_calls: u32,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl Agent {
+    /// Create a new stateless agent
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
-            model: "gemini-1.5-flash-latest".to_string(),
+            model: "gemini-2.0-flash".to_string(),
             system_prompt: None,
-            persistent_tools: Vec::new(),
             client: reqwest::Client::new(),
-            last_request: Mutex::new(Instant::now() - Duration::from_secs(1)),
-            requests_per_second: 2.0,
-            max_function_calls: 10,
+            rate_limiter: Arc::new(RateLimiter::new(2.0)),
         }
     }
 
-    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.system_prompt = Some(prompt.into());
-        self
+    /// Create a new stateful chat agent
+    pub fn chat(api_key: impl Into<String>) -> Chat {
+        Chat {
+            agent: Self::new(api_key),
+            history: Vec::new(),
+        }
     }
 
+    /// Set the model to use
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
     }
 
+    /// Set a system prompt
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Set rate limiting
     pub fn with_requests_per_second(mut self, rps: f64) -> Self {
-        self.requests_per_second = rps;
+        self.rate_limiter = Arc::new(RateLimiter::new(rps));
         self
     }
 
-    pub fn with_max_function_calls(mut self, max: u32) -> Self {
-        self.max_function_calls = max;
-        self
-    }
-
-    pub fn with_tool<T>(mut self, tool: T) -> Self
+    /// Create a prompt - returns a builder that can be configured and awaited
+    pub fn prompt<T>(&self, text: impl Into<String>) -> PromptBuilder<'_, T>
     where
-        T: IntoTool,
+        T: GeminiSchema + for<'de> Deserialize<'de> + Send + 'static,
     {
-        self.persistent_tools.push(Arc::from(tool.into_tool()));
-        self
+        PromptBuilder::new(self, text.into())
     }
 
-    async fn wait_if_needed(&self) {
-        let min_interval = Duration::from_secs_f64(1.0 / self.requests_per_second);
-        let elapsed;
-        {
-            let last = self.last_request.lock().unwrap();
-            elapsed = last.elapsed();
-        }
-
-        if elapsed < min_interval {
-            tokio::time::sleep(min_interval - elapsed).await;
-        }
-
-        let mut last = self.last_request.lock().unwrap();
-        *last = Instant::now();
-    }
-
+    /// Upload a file for use in prompts
     pub async fn upload_file(
         &self,
         data: &[u8],
@@ -476,14 +296,18 @@ impl Agent {
     ) -> Result<FileHandle> {
         let mime_type = mime_type.into();
         let display_name = "file";
-        self.wait_if_needed().await;
+
+        self.rate_limiter.wait().await;
+
         let mut form = MultipartFormData::new();
         let metadata = json!({"file": {"displayName": display_name}});
         form.add_json_field("metadata", &metadata);
         form.add_file_field("file", display_name, &mime_type, data);
         let (content_type, body) = form.finish();
+
         let url =
             "https://generativelanguage.googleapis.com/upload/v1beta/files?uploadType=multipart";
+
         let response = self
             .client
             .post(url)
@@ -492,6 +316,7 @@ impl Agent {
             .body(body)
             .send()
             .await?;
+
         if !response.status().is_success() {
             let error_text = response.text().await?;
             return Err(AdamastorError::FileOperation(format!(
@@ -499,57 +324,19 @@ impl Agent {
                 error_text
             )));
         }
+
         let response_json: Value = response.json().await?;
         FileHandle::from_response(response_json, mime_type)
     }
 
-    pub async fn delete_file(&self, file_handle: &FileHandle) -> Result<()> {
-        self.wait_if_needed().await;
-        let file_id = if let Some(name) = &file_handle.name {
-            name.clone()
-        } else {
-            file_handle
-                .uri
-                .split('/')
-                .last()
-                .map(String::from)
-                .ok_or_else(|| {
-                    AdamastorError::FileOperation("Cannot extract file ID from URI".to_string())
-                })?
-        };
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/{}",
-            file_id
-        );
-        let response = self
-            .client
-            .delete(&url)
-            .header("X-Goog-Api-Key", &self.api_key)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(AdamastorError::FileOperation(format!(
-                "Delete failed: {}",
-                error_text
-            )));
-        }
-        Ok(())
-    }
-
-    pub fn prompt<'a, P>(&'a self, p: P) -> P::Builder
-    where
-        P: Promptable<'a>,
-    {
-        p.into_builder(self)
-    }
-
     async fn call_gemini(&self, request: Value) -> Result<Value> {
-        self.wait_if_needed().await;
+        self.rate_limiter.wait().await;
+
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
             self.model
         );
+
         let response = self
             .client
             .post(&url)
@@ -558,162 +345,169 @@ impl Agent {
             .json(&request)
             .send()
             .await?;
+
         if !response.status().is_success() {
             let error_text = response.text().await?;
             return Err(AdamastorError::Api(error_text));
         }
+
         Ok(response.json().await?)
     }
 }
 
-// ============ Builder Configuration ============
-#[derive(Clone)]
-struct BuilderSettings {
-    tools: Vec<Arc<dyn GeminiTool>>,
-    files: Vec<FileHandle>,
-    retries: u32,
-    temperature: Option<f32>,
-    max_tokens: Option<u32>,
-    top_p: Option<f32>,
-    max_function_calls: Option<u32>,
+// ============ Chat ============
+
+#[derive(Debug, Clone)]
+struct Content {
+    role: String,
+    parts: Vec<Part>,
 }
 
-impl BuilderSettings {
-    fn new(agent: &Agent) -> Self {
-        Self {
-            tools: agent.persistent_tools.clone(),
-            files: Vec::new(),
-            retries: 1,
-            temperature: None,
-            max_tokens: None,
-            top_p: None,
-            max_function_calls: None,
-        }
+#[derive(Debug, Clone)]
+struct Part {
+    text: Option<String>,
+    file_data: Option<FileData>,
+}
+
+#[derive(Debug, Clone)]
+struct FileData {
+    mime_type: String,
+    file_uri: String,
+}
+
+/// Chat agent that maintains conversation history
+pub struct Chat {
+    agent: Agent,
+    history: Vec<Content>,
+}
+
+impl Chat {
+    /// Send a message in the conversation - returns a builder that can be configured and awaited
+    pub fn send<T>(&mut self, text: impl Into<String>) -> ChatPromptBuilder<'_, T>
+    where
+        T: GeminiSchema + for<'de> Deserialize<'de> + Send + 'static,
+    {
+        ChatPromptBuilder::new(self, text.into())
+    }
+
+    /// Set the model to use
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.agent = self.agent.with_model(model);
+        self
+    }
+
+    /// Set a system prompt
+    pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.agent = self.agent.with_system_prompt(prompt);
+        self
+    }
+
+    /// Set rate limiting
+    pub fn with_requests_per_second(mut self, rps: f64) -> Self {
+        self.agent = self.agent.with_requests_per_second(rps);
+        self
+    }
+
+    /// Get access to the underlying agent for file uploads
+    pub fn agent(&self) -> &Agent {
+        &self.agent
     }
 }
 
 // ============ PromptBuilder ============
 
-pub struct PromptBuilder<'a, Input, Output> {
+/// Builder for configuring and executing a single prompt
+pub struct PromptBuilder<'a, T> {
     agent: &'a Agent,
-    prompt: Prompt<Input, Output>,
-    settings: BuilderSettings,
-    _phantom: PhantomData<(Input, Output)>,
+    prompt_text: String,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    top_p: Option<f32>,
+    retries: u32,
+    files: Vec<FileHandle>,
+    _phantom: PhantomData<T>,
 }
 
-impl<'a, Input, Output> PromptBuilder<'a, Input, Output>
-where
-    Input: Serialize + Send + Sync + 'static,
-    Output: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
-{
-    pub fn with_tool<T>(mut self, tool: T) -> Self
-    where
-        T: IntoTool,
-    {
-        self.settings.tools.push(Arc::from(tool.into_tool()));
-        self
-    }
-
-    pub fn with_file(mut self, file_handle: FileHandle) -> Self {
-        self.settings.files.push(file_handle);
-        self
-    }
-
-    pub fn with_files(mut self, file_handles: Vec<FileHandle>) -> Self {
-        self.settings.files.extend(file_handles);
-        self
-    }
-
-    pub fn retries(mut self, n: u32) -> Self {
-        self.settings.retries = n;
-        self
-    }
-
-    pub fn temperature(mut self, temp: f32) -> Self {
-        self.settings.temperature = Some(temp);
-        self
-    }
-
-    pub fn max_tokens(mut self, tokens: u32) -> Self {
-        self.settings.max_tokens = Some(tokens);
-        self
-    }
-
-    pub fn top_p(mut self, p: f32) -> Self {
-        self.settings.top_p = Some(p);
-        self
-    }
-
-    pub fn max_function_calls(mut self, max: u32) -> Self {
-        self.settings.max_function_calls = Some(max);
-        self
-    }
-
-    pub fn returns<NewOutput>(self) -> PromptBuilder<'a, Input, NewOutput>
-    where
-        NewOutput: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
-    {
-        let new_prompt =
-            Prompt::<Input, NewOutput>::new(Box::new(move |input| self.prompt.render(input)));
-
-        PromptBuilder {
-            agent: self.agent,
-            prompt: new_prompt,
-            settings: self.settings,
+impl<'a, T: 'static> PromptBuilder<'a, T> {
+    fn new(agent: &'a Agent, prompt_text: String) -> Self {
+        Self {
+            agent,
+            prompt_text,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            retries: 1,
+            files: Vec::new(),
             _phantom: PhantomData,
         }
     }
 
-    pub fn then<NextP>(self, next_prompt: NextP) -> ChainBuilder<'a, Input, NextP::Output>
-    where
-        Input: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
-        Output: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
-        NextP: IntoPrompt<Input = Output> + Send + Sync + 'static,
-        NextP::Output: Serialize + GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
-    {
-        // <-- FIX: Add explicit type annotation to solve inference failure
-        let chain: ChainBuilder<'a, Input, Output> = ChainBuilder::new(self.agent, self.settings);
-        let chain_with_first_step = chain.add_prompt(self.prompt);
-        chain_with_first_step.add_prompt(next_prompt.into_prompt())
+    /// Set the temperature (0.0 to 1.0)
+    pub fn temperature(mut self, temp: f32) -> Self {
+        self.temperature = Some(temp);
+        self
     }
 
-    pub async fn invoke<Args>(self, args: Args) -> Result<Output>
-    where
-        Input: From<Args>,
-    {
-        let input = Input::from(args);
-        let rendered_prompt = self.prompt.render(&input);
-        let mut request = self.build_request(rendered_prompt);
+    /// Set the maximum number of tokens in the response
+    pub fn max_tokens(mut self, tokens: u32) -> Self {
+        self.max_tokens = Some(tokens);
+        self
+    }
 
+    /// Set the top-p value for nucleus sampling
+    pub fn top_p(mut self, p: f32) -> Self {
+        self.top_p = Some(p);
+        self
+    }
+
+    /// Set the number of retry attempts on failure
+    pub fn retries(mut self, n: u32) -> Self {
+        self.retries = n;
+        self
+    }
+
+    /// Attach a file to the prompt
+    pub fn with_file(mut self, file: FileHandle) -> Self {
+        self.files.push(file);
+        self
+    }
+
+    async fn execute(self) -> Result<T>
+    where
+        T: GeminiSchema + for<'de> Deserialize<'de>,
+    {
         let mut last_error = None;
-        for attempt in 0..self.settings.retries {
+
+        for attempt in 0..self.retries {
             if attempt > 0 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500 * (attempt as u64)))
-                    .await;
+                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
             }
 
-            match self.execute_with_tools(&mut request).await {
-                Ok(response_text) => {
-                    return serde_json::from_str(&response_text).map_err(|e| {
-                        AdamastorError::ParseError(format!(
-                            "Failed to parse response into target schema: {}",
-                            e
-                        ))
-                    });
-                }
-                Err(e) => {
-                    last_error = Some(e);
-                }
+            match self.execute_once().await {
+                Ok(result) => return Ok(result),
+                Err(e) => last_error = Some(e),
             }
         }
 
-        Err(last_error.unwrap_or_else(|| AdamastorError::Api("Unknown error".to_string())))
+        Err(last_error.unwrap())
     }
 
-    fn build_request(&self, prompt: String) -> Value {
-        let mut parts = vec![json!({"text": prompt})];
+    async fn execute_once(&self) -> Result<T>
+    where
+        T: GeminiSchema + for<'de> Deserialize<'de>,
+    {
+        let request = self.build_request();
+        let response = self.agent.call_gemini(request).await?;
+        self.parse_response(response)
+    }
 
-        for file in &self.settings.files {
+    fn build_request(&self) -> Value
+    where
+        T: GeminiSchema,
+    {
+        let mut parts = vec![json!({"text": self.prompt_text})];
+
+        for file in &self.files {
             parts.push(json!({
                 "fileData": {
                     "mimeType": file.mime_type,
@@ -735,516 +529,307 @@ where
             });
         }
 
-        let has_tools = !self.settings.tools.is_empty();
-        if !has_tools {
-            let mut generation_config = json!({
-                "responseMimeType": "application/json",
-                "responseSchema": Output::gemini_schema()
-            });
-            if let Some(temp) = self.settings.temperature {
-                generation_config["temperature"] = json!(temp);
-            }
-            if let Some(max) = self.settings.max_tokens {
-                generation_config["maxOutputTokens"] = json!(max);
-            }
-            if let Some(p) = self.settings.top_p {
-                generation_config["topP"] = json!(p);
-            }
-            request["generationConfig"] = generation_config;
-        } else {
-            let mut generation_config = json!({});
-            if let Some(temp) = self.settings.temperature {
-                generation_config["temperature"] = json!(temp);
-            }
-            if let Some(max) = self.settings.max_tokens {
-                generation_config["maxOutputTokens"] = json!(max);
-            }
-            if let Some(p) = self.settings.top_p {
-                generation_config["topP"] = json!(p);
-            }
-            if !generation_config.as_object().unwrap().is_empty() {
-                request["generationConfig"] = generation_config;
-            }
+        let mut generation_config = json!({});
 
-            let declarations: Vec<Value> = self
-                .settings
-                .tools
-                .iter()
-                .map(|t| t.declaration())
-                .collect();
-            request["tools"] = json!([{ "functionDeclarations": declarations }]);
-            request["toolConfig"] = json!({ "functionCallingConfig": {"mode": "AUTO"} });
+        // Check if T is String using TypeId - if not, it's a structured type
+        if TypeId::of::<T>() != TypeId::of::<String>() {
+            generation_config["responseMimeType"] = json!("application/json");
+            generation_config["responseSchema"] = T::gemini_schema();
+        }
+
+        if let Some(temp) = self.temperature {
+            generation_config["temperature"] = json!(temp);
+        }
+        if let Some(max) = self.max_tokens {
+            generation_config["maxOutputTokens"] = json!(max);
+        }
+        if let Some(p) = self.top_p {
+            generation_config["topP"] = json!(p);
+        }
+
+        if !generation_config.as_object().unwrap().is_empty() {
+            request["generationConfig"] = generation_config;
         }
 
         request
     }
 
-    async fn execute_with_tools(&self, request: &mut Value) -> Result<String> {
-        let mut current_request = request.clone();
-        let max_iterations = self
-            .settings
-            .max_function_calls
-            .unwrap_or(self.agent.max_function_calls);
-        let mut final_text_response = None;
-        let mut iterations = 0;
+    fn parse_response(&self, response: Value) -> Result<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let text = response
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.get(0))
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| AdamastorError::ParseError("Missing text in response".to_string()))?;
 
-        loop {
-            if iterations >= max_iterations {
-                return Err(AdamastorError::MaxFunctionCalls(max_iterations));
-            }
-            iterations += 1;
-
-            let response = self.agent.call_gemini(current_request.clone()).await?;
-            let first_candidate = response
-                .get("candidates")
-                .and_then(|c| c.get(0))
-                .ok_or_else(|| {
-                    AdamastorError::ParseError("Missing candidates in response".to_string())
-                })?;
-
-            if let Some(parts) = first_candidate["content"]["parts"].as_array() {
-                let mut has_function_call = false;
-                let mut function_responses = vec![];
-
-                for part in parts {
-                    if let Some(function_call) = part.get("functionCall") {
-                        has_function_call = true;
-                        let name = function_call["name"].as_str().ok_or_else(|| {
-                            AdamastorError::ParseError("Function call missing name".to_string())
-                        })?;
-                        let default_args = json!({});
-                        let args = function_call.get("args").unwrap_or(&default_args);
-
-                        let tool = self
-                            .settings
-                            .tools
-                            .iter()
-                            .find(|t| t.name() == name)
-                            .ok_or_else(|| AdamastorError::ToolNotFound(name.to_string()))?;
-
-                        match tool.execute(args.clone()).await {
-                            Ok(result) => {
-                                function_responses.push(json!({
-                                    "functionResponse": { "name": name, "response": { "content": result } }
-                                }));
-                            }
-                            Err(e) => {
-                                return Err(AdamastorError::ToolExecution {
-                                    tool: name.to_string(),
-                                    error: e.to_string(),
-                                });
-                            }
-                        }
-                    } else if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                        if !has_function_call {
-                            final_text_response = Some(text.to_string());
-                        }
-                    }
-                }
-
-                if has_function_call {
-                    let mut messages = current_request["contents"]
-                        .as_array()
-                        .cloned()
-                        .unwrap_or_default();
-                    messages.push(json!({ "role": "model", "parts": parts }));
-                    messages.push(json!({ "role": "user", "parts": function_responses }));
-                    current_request["contents"] = json!(messages);
-                } else {
-                    break;
-                }
-            }
-        }
-
-        if let Some(text) = final_text_response {
-            let format_prompt = format!(
-                "Convert the following information into JSON format matching this schema:\n\n\
-                Schema: {}\n\n\
-                Information to convert:\n{}\n\n\
-                Return ONLY valid JSON, no additional text.",
-                serde_json::to_string_pretty(&Output::gemini_schema())?,
-                text
-            );
-
-            let format_request = json!({
-                "contents": [{
-                    "role": "user",
-                    "parts": [{"text": format_prompt}]
-                }],
-                "generationConfig": {
-                    "responseMimeType": "application/json",
-                    "responseSchema": Output::gemini_schema(),
-                    "temperature": 0.1
-                }
-            });
-
-            let format_response = self.agent.call_gemini(format_request).await?;
-            format_response
-                .get("candidates")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("content"))
-                .and_then(|c| c.get("parts"))
-                .and_then(|p| p.get(0))
-                .and_then(|p| p.get("text"))
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    AdamastorError::ParseError(
-                        "Failed to extract formatted JSON from response".to_string(),
-                    )
-                })
+        // If T is String, just return the text directly
+        if TypeId::of::<T>() == TypeId::of::<String>() {
+            // Safe because we checked the type
+            let result: T = unsafe { std::mem::transmute_copy(&text.to_string()) };
+            std::mem::forget(text.to_string());
+            Ok(result)
         } else {
-            Err(AdamastorError::NoResponse(iterations))
+            // Otherwise parse as JSON
+            serde_json::from_str(text).map_err(|e| {
+                AdamastorError::ParseError(format!(
+                    "Failed to parse response into target schema: {}",
+                    e
+                ))
+            })
         }
     }
 }
 
-// ============ UntypedPromptBuilder ============
-
-pub struct UntypedPromptBuilder<'a> {
-    agent: &'a Agent,
-    prompt_text: String,
-    settings: BuilderSettings,
-}
-
-impl<'a> UntypedPromptBuilder<'a> {
-    pub fn new(agent: &'a Agent, prompt_text: impl Into<String>) -> Self {
-        Self {
-            agent,
-            prompt_text: prompt_text.into(),
-            settings: BuilderSettings::new(agent),
-        }
-    }
-
-    pub fn with_tool<T>(mut self, tool: T) -> Self
-    where
-        T: IntoTool,
-    {
-        self.settings.tools.push(Arc::from(tool.into_tool()));
-        self
-    }
-
-    pub fn with_file(mut self, file_handle: FileHandle) -> Self {
-        self.settings.files.push(file_handle);
-        self
-    }
-
-    pub fn with_files(mut self, file_handles: Vec<FileHandle>) -> Self {
-        self.settings.files.extend(file_handles);
-        self
-    }
-
-    pub fn retries(mut self, n: u32) -> Self {
-        self.settings.retries = n;
-        self
-    }
-
-    pub fn temperature(mut self, temp: f32) -> Self {
-        self.settings.temperature = Some(temp);
-        self
-    }
-
-    pub fn max_tokens(mut self, tokens: u32) -> Self {
-        self.settings.max_tokens = Some(tokens);
-        self
-    }
-
-    pub fn top_p(mut self, p: f32) -> Self {
-        self.settings.top_p = Some(p);
-        self
-    }
-
-    pub fn max_function_calls(mut self, max: u32) -> Self {
-        self.settings.max_function_calls = Some(max);
-        self
-    }
-
-    pub fn returns<Output>(self) -> PromptBuilder<'a, (), Output>
-    where
-        Output: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
-    {
-        let prompt_text = self.prompt_text;
-        let prompt = Prompt::<(), Output>::new(Box::new(move |_| prompt_text.clone()));
-
-        PromptBuilder {
-            agent: self.agent,
-            prompt,
-            settings: self.settings,
-            _phantom: PhantomData,
-        }
-    }
-
-    pub async fn invoke<Output>(self) -> Result<Output>
-    where
-        Output: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
-    {
-        self.returns::<Output>().invoke(()).await
-    }
-}
-
-// ============ ChainBuilder ============
-
-type ChainStepFn<'a> = Box<
-    dyn for<'b> Fn(&'b Agent, &'b BuilderSettings, Value) -> BoxFuture<'b, Result<Value>>
-        + Send
-        + Sync,
->;
-
-pub struct ChainBuilder<'a, InitialInput, FinalOutput> {
-    agent: &'a Agent,
-    settings: BuilderSettings,
-    steps: Vec<ChainStepFn<'a>>,
-    _phantom: PhantomData<(InitialInput, FinalOutput)>,
-}
-
-impl<'a, InitialInput, FinalOutput> ChainBuilder<'a, InitialInput, FinalOutput>
+impl<'a, T> IntoFuture for PromptBuilder<'a, T>
 where
-    InitialInput: Serialize + Send,
-    FinalOutput: for<'de> Deserialize<'de> + Send,
+    T: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
 {
-    fn new(agent: &'a Agent, settings: BuilderSettings) -> Self {
+    type Output = Result<T>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.execute())
+    }
+}
+
+// ============ ChatPromptBuilder ============
+
+/// Builder for configuring and executing a chat message
+pub struct ChatPromptBuilder<'a, T> {
+    chat: &'a mut Chat,
+    prompt_text: String,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    top_p: Option<f32>,
+    retries: u32,
+    files: Vec<FileHandle>,
+    _phantom: PhantomData<T>,
+}
+
+impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
+    fn new(chat: &'a mut Chat, prompt_text: String) -> Self {
         Self {
-            agent,
-            settings,
-            steps: Vec::new(),
+            chat,
+            prompt_text,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            retries: 1,
+            files: Vec::new(),
             _phantom: PhantomData,
         }
     }
 
-    fn add_prompt<PIn, POut>(
-        mut self,
-        prompt: Prompt<PIn, POut>,
-    ) -> ChainBuilder<'a, InitialInput, POut>
+    /// Set the temperature (0.0 to 1.0)
+    pub fn temperature(mut self, temp: f32) -> Self {
+        self.temperature = Some(temp);
+        self
+    }
+
+    /// Set the maximum number of tokens in the response
+    pub fn max_tokens(mut self, tokens: u32) -> Self {
+        self.max_tokens = Some(tokens);
+        self
+    }
+
+    /// Set the top-p value for nucleus sampling
+    pub fn top_p(mut self, p: f32) -> Self {
+        self.top_p = Some(p);
+        self
+    }
+
+    /// Set the number of retry attempts on failure
+    pub fn retries(mut self, n: u32) -> Self {
+        self.retries = n;
+        self
+    }
+
+    /// Attach a file to this message
+    pub fn with_file(mut self, file: FileHandle) -> Self {
+        self.files.push(file);
+        self
+    }
+
+    async fn execute(mut self) -> Result<T>
     where
-        PIn: Serialize + for<'de> Deserialize<'de> + Send + Sync + 'static,
-        POut: Serialize + GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
+        T: GeminiSchema + for<'de> Deserialize<'de>,
     {
-        let step: ChainStepFn<'a> = Box::new(move |agent, settings, val| {
-            // <-- FIX: Clone prompt *before* async move block
-            let prompt_clone = prompt.clone();
-            Box::pin(async move {
-                let p_builder = PromptBuilder {
-                    agent,
-                    prompt: prompt_clone,
-                    settings: settings.clone(),
-                    _phantom: PhantomData,
-                };
-                let args: PIn = serde_json::from_value(val)?;
-                let output: POut = p_builder.invoke(args).await?;
-                serde_json::to_value(output).map_err(AdamastorError::from)
-            })
+        let mut last_error = None;
+
+        for attempt in 0..self.retries {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+            }
+
+            match self.execute_once().await {
+                Ok(result) => return Ok(result),
+                Err(e) => last_error = Some(e),
+            }
+        }
+
+        Err(last_error.unwrap())
+    }
+
+    async fn execute_once(&mut self) -> Result<T>
+    where
+        T: GeminiSchema + for<'de> Deserialize<'de>,
+    {
+        // Add user message to history
+        let mut user_parts = vec![Part {
+            text: Some(self.prompt_text.clone()),
+            file_data: None,
+        }];
+
+        for file in &self.files {
+            user_parts.push(Part {
+                text: None,
+                file_data: Some(FileData {
+                    mime_type: file.mime_type.clone(),
+                    file_uri: file.uri.clone(),
+                }),
+            });
+        }
+
+        self.chat.history.push(Content {
+            role: "user".to_string(),
+            parts: user_parts,
         });
-        self.steps.push(step);
-        ChainBuilder {
-            agent: self.agent,
-            settings: self.settings,
-            steps: self.steps,
-            _phantom: PhantomData,
-        }
-    }
 
-    pub fn then<NextP>(self, next_prompt: NextP) -> ChainBuilder<'a, InitialInput, NextP::Output>
-    where
-        NextP: IntoPrompt<Input = FinalOutput> + Send + Sync + 'static,
-        FinalOutput: Serialize + GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
-        NextP::Output: Serialize + GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
-    {
-        self.add_prompt(next_prompt.into_prompt())
-    }
+        // Build request with full history
+        let request = self.build_request();
+        let response = self.chat.agent.call_gemini(request).await?;
 
-    pub async fn invoke<Args>(self, args: Args) -> Result<FinalOutput>
-    where
-        InitialInput: From<Args>,
-    {
-        let mut current_value = serde_json::to_value(InitialInput::from(args))?;
-        for step in self.steps {
-            current_value = step(self.agent, &self.settings, current_value).await?;
-        }
-        serde_json::from_value(current_value).map_err(|e| {
-            AdamastorError::ParseError(format!("Failed to parse final chain output: {}", e))
-        })
-    }
-}
+        // Parse response
+        let (result, response_text) = self.parse_response(response)?;
 
-// ============ Embedding Support ============
-
-pub struct SingleEmbedBuilder<'a> {
-    agent: &'a Agent,
-    content: String,
-    is_query: bool,
-    output_dimensionality: Option<u32>,
-}
-
-pub struct BatchEmbedBuilder<'a> {
-    agent: &'a Agent,
-    contents: Vec<String>,
-    is_query: bool,
-    output_dimensionality: Option<u32>,
-}
-
-impl<'a> SingleEmbedBuilder<'a> {
-    fn new(agent: &'a Agent, content: impl Into<String>) -> Self {
-        Self {
-            agent,
-            content: content.into(),
-            is_query: false,
-            output_dimensionality: None,
-        }
-    }
-
-    pub fn as_query(mut self) -> Self {
-        self.is_query = true;
-        self
-    }
-
-    pub fn with_dim(mut self, dim: u32) -> Self {
-        self.output_dimensionality = Some(dim);
-        self
-    }
-
-    pub async fn invoke(self) -> Result<Vec<f32>> {
-        self.agent.wait_if_needed().await;
-        let model = "models/text-embedding-004";
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/{}:embedContent",
-            model
-        );
-        let mut body = json!({
-            "model": model,
-            "content": {
-                "parts": [{
-                    "text": self.content
-                }]
-            },
-            "taskType": if self.is_query { "RETRIEVAL_QUERY" } else { "RETRIEVAL_DOCUMENT" }
+        // Add model response to history
+        self.chat.history.push(Content {
+            role: "model".to_string(),
+            parts: vec![Part {
+                text: Some(response_text),
+                file_data: None,
+            }],
         });
-        if let Some(dim) = self.output_dimensionality {
-            body["outputDimensionality"] = json!(dim);
-        }
-        let response = self
-            .agent
-            .client
-            .post(&url)
-            .header("x-goog-api-key", &self.agent.api_key)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(AdamastorError::Api(format!(
-                "Embedding failed: {}",
-                error_text
-            )));
-        }
-        let response_json: Value = response.json().await?;
-        response_json
-            .get("embedding")
-            .and_then(|e| e.get("values"))
-            .and_then(|v| v.as_array())
-            .ok_or_else(|| AdamastorError::ParseError("Missing embedding values".to_string()))?
+
+        Ok(result)
+    }
+
+    fn build_request(&self) -> Value
+    where
+        T: GeminiSchema,
+    {
+        // Convert history to Gemini format
+        let contents: Vec<Value> = self
+            .chat
+            .history
             .iter()
-            .map(|v| {
-                v.as_f64()
-                    .map(|f| f as f32)
-                    .ok_or_else(|| AdamastorError::ParseError("Invalid value".to_string()))
-            })
-            .collect()
-    }
-}
+            .map(|content| {
+                let parts: Vec<Value> = content
+                    .parts
+                    .iter()
+                    .map(|part| {
+                        if let Some(text) = &part.text {
+                            json!({"text": text})
+                        } else if let Some(file_data) = &part.file_data {
+                            json!({
+                                "fileData": {
+                                    "mimeType": file_data.mime_type,
+                                    "fileUri": file_data.file_uri
+                                }
+                            })
+                        } else {
+                            json!({"text": ""})
+                        }
+                    })
+                    .collect();
 
-impl<'a> BatchEmbedBuilder<'a> {
-    fn new(agent: &'a Agent, contents: &[impl AsRef<str>]) -> Self {
-        Self {
-            agent,
-            contents: contents.iter().map(|s| s.as_ref().to_string()).collect(),
-            is_query: false,
-            output_dimensionality: None,
-        }
-    }
-
-    pub fn as_query(mut self) -> Self {
-        self.is_query = true;
-        self
-    }
-
-    pub fn with_dim(mut self, dim: u32) -> Self {
-        self.output_dimensionality = Some(dim);
-        self
-    }
-
-    pub async fn invoke(self) -> Result<Vec<Vec<f32>>> {
-        self.agent.wait_if_needed().await;
-        let model = "models/text-embedding-004";
-        let url = format!(
-            "https://generativelanguage.googleapis.com/v1beta/{}:batchEmbedContents",
-            model
-        );
-        let requests: Vec<Value> = self
-            .contents
-            .iter()
-            .map(|text| {
-                let mut req = json!({
-                    "model": model,
-                    "content": {
-                        "parts": [{
-                            "text": text
-                        }]
-                    },
-                    "taskType": if self.is_query { "RETRIEVAL_QUERY" } else { "RETRIEVAL_DOCUMENT" }
-                });
-                if let Some(dim) = self.output_dimensionality {
-                    req["outputDimensionality"] = json!(dim);
-                }
-                req
+                json!({
+                    "role": content.role,
+                    "parts": parts
+                })
             })
             .collect();
-        let body = json!({"requests": requests});
-        let response = self
-            .agent
-            .client
-            .post(&url)
-            .header("x-goog-api-key", &self.agent.api_key)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(AdamastorError::Api(format!(
-                "Batch embedding failed: {}",
-                error_text
-            )));
+
+        let mut request = json!({
+            "contents": contents
+        });
+
+        if let Some(system_prompt) = &self.chat.agent.system_prompt {
+            request["systemInstruction"] = json!({
+                "parts": [{"text": system_prompt}]
+            });
         }
-        let response_json: Value = response.json().await?;
-        response_json
-            .get("embeddings")
-            .and_then(|e| e.as_array())
-            .ok_or_else(|| AdamastorError::ParseError("Missing embeddings".to_string()))?
-            .iter()
-            .map(|embedding| {
-                embedding
-                    .get("values")
-                    .and_then(|v| v.as_array())
-                    .ok_or_else(|| AdamastorError::ParseError("Missing values".to_string()))?
-                    .iter()
-                    .map(|v| {
-                        v.as_f64()
-                            .map(|f| f as f32)
-                            .ok_or_else(|| AdamastorError::ParseError("Invalid value".to_string()))
-                    })
-                    .collect::<Result<Vec<f32>>>()
-            })
-            .collect()
+
+        let mut generation_config = json!({});
+
+        if TypeId::of::<T>() != TypeId::of::<String>() {
+            generation_config["responseMimeType"] = json!("application/json");
+            generation_config["responseSchema"] = T::gemini_schema();
+        }
+
+        if let Some(temp) = self.temperature {
+            generation_config["temperature"] = json!(temp);
+        }
+        if let Some(max) = self.max_tokens {
+            generation_config["maxOutputTokens"] = json!(max);
+        }
+        if let Some(p) = self.top_p {
+            generation_config["topP"] = json!(p);
+        }
+
+        if !generation_config.as_object().unwrap().is_empty() {
+            request["generationConfig"] = generation_config;
+        }
+
+        request
+    }
+
+    fn parse_response(&self, response: Value) -> Result<(T, String)>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let text = response
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.get(0))
+            .and_then(|p| p.get("text"))
+            .and_then(|t| t.as_str())
+            .ok_or_else(|| AdamastorError::ParseError("Missing text in response".to_string()))?;
+
+        let parsed = if TypeId::of::<T>() == TypeId::of::<String>() {
+            // Safe because we checked the type
+            let result: T = unsafe { std::mem::transmute_copy(&text.to_string()) };
+            std::mem::forget(text.to_string());
+            result
+        } else {
+            serde_json::from_str(text).map_err(|e| {
+                AdamastorError::ParseError(format!(
+                    "Failed to parse response into target schema: {}",
+                    e
+                ))
+            })?
+        };
+
+        Ok((parsed, text.to_string()))
     }
 }
 
-impl Agent {
-    pub fn embed(&self, content: impl Into<String>) -> SingleEmbedBuilder {
-        SingleEmbedBuilder::new(self, content)
-    }
+impl<'a, T> IntoFuture for ChatPromptBuilder<'a, T>
+where
+    T: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
+{
+    type Output = Result<T>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
 
-    pub fn embed_batch<S: AsRef<str>>(&self, contents: &[S]) -> BatchEmbedBuilder {
-        BatchEmbedBuilder::new(self, contents)
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(self.execute())
     }
 }
