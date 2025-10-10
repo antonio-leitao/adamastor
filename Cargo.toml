@@ -3,10 +3,17 @@ members = [
     ".", # The main crate
     "adamastor-macros",
 ]
+
 [package]
 name = "adamastor"
 version = "0.2.0"
-edition = "2024"
+edition = "2021"
+license = "MIT"
+description = "Type-safe Rust framework for building LLM agents with structured outputs"
+repository = "https://github.com/antonio-leitao/adamastor"
+keywords = ["llm", "gemini", "ai", "agent", "type-safe"]
+categories = ["api-bindings", "web-programming"]
+authors = ["António Leitão <leitaoto@gmail.com>"]
 
 [dependencies]
 async-trait = "0.1.89"
@@ -14,7 +21,7 @@ reqwest = { version = "0.12.23", features = ["json"] }
 serde = { version = "1.0.226", features = ["derive"] }
 serde_json = "1.0.145"
 tokio = { version = "1.47.1", features = ["full"] }
-adamastor-macros = { path = "adamastor-macros" }
+adamastor-macros = { version = "0.2.0", path = "adamastor-macros" }
 uuid = { version = "1.18.1", features = ["v4"] }
 thiserror = "2.0.16"
 futures = "0.3.31"
