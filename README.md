@@ -21,6 +21,7 @@ Adamastor is a Rust framework that makes working with Large Language Models **ty
 ## Features
 
 - **Type-safe structured outputs** - Define response schemas with Rust structs
+- **Tool calling** - Let models call your functions with type-safe arguments
 - **Stateful conversations** - Built-in chat support with automatic history management
 - **File handling** - Upload and reference files in prompts (multimodal)
 - **Flexible configuration** - Per-request overrides of agent defaults
@@ -181,7 +182,159 @@ async fn main() -> Result<()> {
 
 ---
 
-### 4. Turbofish Syntax (Alternative)
+### 4. Tool Calling (Function Calling)
+
+Enable models to call your functions to access real-time data or perform actions:
+
+```rust
+use adamastor::{Agent, schema, Result};
+
+#[schema]
+struct WeatherArgs {
+    /// The city name, e.g., "Tokyo", "London"
+    location: String,
+}
+
+// Your actual function implementation
+async fn get_weather(location: &str) -> Result<String> {
+    // In real app: call weather API
+    Ok(format!("Weather in {}: Sunny, 22°C", location))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let agent = Agent::new(std::env::var("GEMINI_API_KEY")?);
+
+    let response: String = agent
+        .prompt("What's the weather like in Tokyo?")
+        .with_tool("get_weather", |args: WeatherArgs| async move {
+            get_weather(&args.location).await
+        })
+        .await?;
+
+    println!("{}", response);
+    // Output: "The weather in Tokyo is sunny with a temperature of 22°C."
+
+    Ok(())
+}
+```
+
+**How it works:**
+
+1. Model receives your prompt and tool definition
+2. Model decides to call `get_weather` with `{"location": "Tokyo"}`
+3. Your callback executes and returns the weather data
+4. Model generates a natural language response using that data
+
+**Use cases:**
+
+- 🌐 Fetch real-time data (weather, stock prices, news)
+- 🗄️ Query databases or APIs
+- 📧 Perform actions (send emails, create calendar events)
+- 🧮 Run calculations or code execution
+
+---
+
+### 5. Compositional Tool Calling
+
+Models can chain multiple tool calls to accomplish complex tasks:
+
+```rust
+use adamastor::{Agent, schema, Result};
+
+#[schema]
+struct LocationArgs {}
+
+#[schema]
+struct WeatherArgs {
+    location: String,
+}
+
+async fn get_current_location() -> Result<String> {
+    // In real app: use IP geolocation or GPS
+    Ok("San Francisco".to_string())
+}
+
+async fn get_weather(location: &str) -> Result<String> {
+    Ok(format!("Weather in {}: Sunny, 20°C", location))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let agent = Agent::new(std::env::var("GEMINI_API_KEY")?);
+
+    // Model will first call get_current_location, then get_weather
+    let response: String = agent
+        .prompt("What's the weather like where I am?")
+        .with_tool("get_current_location", |_args: LocationArgs| async {
+            get_current_location().await
+        })
+        .with_tool("get_weather", |args: WeatherArgs| async move {
+            get_weather(&args.location).await
+        })
+        .with_max_function_calls(5)  // Allow multiple tool calls
+        .await?;
+
+    println!("{}", response);
+
+    Ok(())
+}
+```
+
+The model automatically:
+
+1. Calls `get_current_location()` → "San Francisco"
+2. Calls `get_weather("San Francisco")` → "Sunny, 20°C"
+3. Generates response: "The weather in San Francisco is sunny at 20°C"
+
+---
+
+### 6. Tool Calling with Structured Output
+
+Combine tools with structured responses:
+
+```rust
+use adamastor::{Agent, schema, Result};
+
+#[schema]
+struct WeatherArgs {
+    location: String,
+}
+
+#[schema]
+struct TravelPlan {
+    destination: String,
+    activities: Vec<String>,
+    packing_list: Vec<String>,
+}
+
+async fn get_weather(location: &str) -> Result<String> {
+    Ok(format!("Weather in {}: Rainy, 15°C", location))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let agent = Agent::new(std::env::var("GEMINI_API_KEY")?);
+
+    // Get structured output that uses tool data
+    let plan: TravelPlan = agent
+        .prompt("Create a weekend travel plan for London")
+        .with_tool("get_weather", |args: WeatherArgs| async move {
+            get_weather(&args.location).await
+        })
+        .await?;
+
+    println!("Destination: {}", plan.destination);
+    println!("Activities: {:?}", plan.activities);
+    println!("Packing: {:?}", plan.packing_list);
+
+    Ok(())
+}
+```
+
+---
+
+### 7. Turbofish Syntax (Alternative)
 
 When type inference isn't enough, use turbofish:
 
@@ -203,7 +356,7 @@ let poem = agent
 
 ---
 
-### 5. Stateful Conversations with Chat
+### 8. Stateful Conversations with Chat
 
 Use `Chat` for multi-turn conversations with automatic history management:
 
@@ -258,7 +411,53 @@ async fn main() -> Result<()> {
 
 ---
 
-### 6. Manual Chaining (Type-Safe)
+### 9. Tool Calling in Chat
+
+Tools work seamlessly with stateful conversations:
+
+```rust
+use adamastor::{Agent, schema, Result};
+
+#[schema]
+struct WeatherArgs {
+    location: String,
+}
+
+async fn get_weather(location: &str) -> Result<String> {
+    Ok(format!("Weather in {}: Clear, 18°C", location))
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let mut chat = Agent::chat(std::env::var("GEMINI_API_KEY")?);
+
+    // First message with tool
+    let response: String = chat
+        .send("What's the weather in Paris?")
+        .with_tool("get_weather", |args: WeatherArgs| async move {
+            get_weather(&args.location).await
+        })
+        .await?;
+
+    println!("{}", response);
+
+    // Follow-up remembers context
+    let follow_up: String = chat
+        .send("Should I bring an umbrella?")
+        .with_tool("get_weather", |args: WeatherArgs| async move {
+            get_weather(&args.location).await
+        })
+        .await?;
+
+    println!("{}", follow_up);
+
+    Ok(())
+}
+```
+
+---
+
+### 10. Manual Chaining (Type-Safe)
 
 Chain prompts by passing outputs as inputs:
 
@@ -349,13 +548,15 @@ use adamastor::Agent;
 let agent = Agent::new(api_key)
     .with_model("gemini-2.0-flash")                    // Model selection
     .with_system_prompt("You are a helpful assistant") // System instructions
-    .with_requests_per_second(3.0);                    // Rate limiting (default: 2.0)
+    .with_requests_per_second(3.0)                     // Rate limiting (default: 2.0)
+    .with_max_function_calls(10);                      // Tool call limit (default: 10)
 
 // Stateful chat agent
 let mut chat = Agent::chat(api_key)
     .with_model("gemini-2.5-pro")
     .with_system_prompt("You are a creative writing assistant")
-    .with_requests_per_second(1.5);
+    .with_requests_per_second(1.5)
+    .with_max_function_calls(5);
 ```
 
 ---
@@ -379,18 +580,24 @@ let response: String = agent
     // Files
     .with_file(file_handle)   // Attach a single file
 
+    // Tools
+    .with_tool("tool_name", callback)  // Add a tool
+    .with_max_function_calls(5)        // Override tool call limit
+
     .await?;
 ```
 
 **All Configuration Methods:**
 
-| Method                   | Type         | Description                                 | Default       |
-| ------------------------ | ------------ | ------------------------------------------- | ------------- |
-| `.temperature(f32)`      | `0.0 - 1.0`  | Controls randomness. Higher = more creative | Model default |
-| `.max_tokens(u32)`       | `u32`        | Maximum tokens in response                  | No limit      |
-| `.top_p(f32)`            | `0.0 - 1.0`  | Nucleus sampling threshold                  | Model default |
-| `.retries(u32)`          | `u32`        | Number of retry attempts on failure         | `1`           |
-| `.with_file(FileHandle)` | `FileHandle` | Attach a file to the prompt                 | None          |
+| Method                          | Type         | Description                                 | Default       |
+| ------------------------------- | ------------ | ------------------------------------------- | ------------- |
+| `.temperature(f32)`             | `0.0 - 1.0`  | Controls randomness. Higher = more creative | Model default |
+| `.max_tokens(u32)`              | `u32`        | Maximum tokens in response                  | No limit      |
+| `.top_p(f32)`                   | `0.0 - 1.0`  | Nucleus sampling threshold                  | Model default |
+| `.retries(u32)`                 | `u32`        | Number of retry attempts on failure         | `1`           |
+| `.with_file(FileHandle)`        | `FileHandle` | Attach a file to the prompt                 | None          |
+| `.with_tool(name, callback)`    | Closure      | Add a tool the model can call               | None          |
+| `.with_max_function_calls(u32)` | `u32`        | Maximum tool call iterations                | `10`          |
 
 ---
 
@@ -418,9 +625,6 @@ async fn main() -> Result<()> {
         .await?;
 
     println!("Summary:\n{}", summary);
-
-    // Optional: Delete file (auto-deleted after 48h anyway)
-    agent.delete_file(&file_handle).await?;
 
     Ok(())
 }
@@ -525,56 +729,30 @@ struct Article {
 
 ---
 
-### Advanced Schema Example
+### Tool Arguments
+
+Tool arguments use the same `#[schema]` macro:
 
 ```rust
 use adamastor::schema;
 
 #[schema]
-struct CodeAnalysis {
-    /// The programming language detected
-    language: String,
+struct SearchArgs {
+    /// The search query string
+    query: String,
 
-    /// Overall code quality score (0-100)
-    quality_score: u32,
+    /// Maximum number of results to return
+    max_results: u32,
 
-    /// List of identified issues
-    issues: Vec<Issue>,
-
-    /// Suggested improvements
-    suggestions: Vec<String>,
-
-    /// Whether the code follows best practices
-    follows_best_practices: bool,
-
-    /// Estimated complexity (simple, moderate, complex)
-    complexity: String,
-
-    /// Optional security concerns
-    security_notes: Option<String>,
+    /// Optional category filter
+    category: Option<String>,
 }
 
-#[schema]
-struct Issue {
-    /// Line number where issue occurs
-    line: u32,
-
-    /// Severity: "error", "warning", or "info"
-    severity: String,
-
-    /// Description of the issue
-    message: String,
-}
-
-// Use it
-let analysis: CodeAnalysis = agent
-    .prompt("Analyze this Rust code: fn main() { ... }")
-    .await?;
-
-println!("Quality: {}/100", analysis.quality_score);
-for issue in analysis.issues {
-    println!("[{}] Line {}: {}", issue.severity, issue.line, issue.message);
-}
+// Use in tool
+agent.prompt("Search for Rust tutorials")
+    .with_tool("search", |args: SearchArgs| async move {
+        perform_search(&args.query, args.max_results).await
+    })
 ```
 
 ---
@@ -626,97 +804,18 @@ match agent.prompt("Hello").await {
 | `Json(serde_json::Error)` | JSON error              | Invalid JSON structure                           |
 | `FileOperation(String)`   | File operation failed   | Upload failed, file not found, invalid MIME type |
 
----
+**Tool Errors:**
 
-## Complete Real-World Example
-
-Here's a complete example showing multiple features:
+If a tool callback returns an error, it's immediately propagated to the caller:
 
 ```rust
-use adamastor::{Agent, schema, Result};
-
-#[schema]
-struct Character {
-    name: String,
-    age: u32,
-    personality_traits: Vec<String>,
-    backstory: String,
-}
-
-#[schema]
-struct Scene {
-    setting: String,
-    dialogue: Vec<String>,
-    action: String,
-}
-
-fn create_character(genre: &str) -> String {
-    format!("Create a compelling {} character with depth and motivation", genre)
-}
-
-fn write_scene(character: &Character, situation: &str) -> String {
-    format!(
-        "Write a scene where {} (personality: {:?}) faces this situation: {}",
-        character.name, character.personality_traits, situation
-    )
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Configure agent
-    let agent = Agent::new(std::env::var("GEMINI_API_KEY")?)
-        .with_model("gemini-1.5-flash")
-        .with_system_prompt("You are a creative writing assistant specializing in fiction")
-        .with_requests_per_second(2.0);
-
-    println!("🎭 Character Creator\n");
-
-    // Step 1: Create a character
-    let character: Character = agent
-        .prompt(create_character("sci-fi"))
-        .temperature(0.9)  // High creativity
-        .retries(2)
-        .await?;
-
-    println!("Character: {} (age {})", character.name, character.age);
-    println!("Traits: {}", character.personality_traits.join(", "));
-    println!("Backstory: {}\n", character.backstory);
-
-    // Step 2: Write a scene
-    let scene: Scene = agent
-        .prompt(write_scene(&character, "discovering a hidden truth about their past"))
-        .temperature(0.85)
-        .await?;
-
-    println!("📝 Scene");
-    println!("Setting: {}", scene.setting);
-    println!("\nDialogue:");
-    for line in scene.dialogue {
-        println!("  {}", line);
-    }
-    println!("\nAction: {}", scene.action);
-
-    // Step 3: Use chat for revisions
-    let mut chat = Agent::chat(std::env::var("GEMINI_API_KEY")?)
-        .with_model("gemini-1.5-flash");
-
-    let revision: String = chat
-        .send(format!(
-            "Here's a scene I wrote:\n\n{}\n\nHow can I make it more suspenseful?",
-            scene.action
-        ))
-        .await?;
-
-    println!("\n💡 Revision Suggestion:\n{}", revision);
-
-    let improved: String = chat
-        .send("Can you rewrite it with those improvements?")
-        .await?;
-
-    println!("\n✨ Improved Version:\n{}", improved);
-
-    Ok(())
-}
+let result: String = agent
+    .prompt("Get data")
+    .with_tool("fetch_data", |args: DataArgs| async move {
+        // If this returns Err, the entire prompt fails
+        fetch_from_database(&args.id).await
+    })
+    .await?;  // Error propagated here
 ```
 
 ---
@@ -734,6 +833,7 @@ Agent::chat(api_key: impl Into<String>) -> Chat
 .with_model(model: impl Into<String>) -> Self
 .with_system_prompt(prompt: impl Into<String>) -> Self
 .with_requests_per_second(rps: f64) -> Self
+.with_max_function_calls(max: u32) -> Self
 
 // Prompt execution
 .prompt<T>(text: impl Into<String>) -> PromptBuilder<'_, T>
@@ -741,7 +841,6 @@ Agent::chat(api_key: impl Into<String>) -> Chat
 
 // File operations
 async .upload_file(data: &[u8], mime_type: impl Into<String>) -> Result<FileHandle>
-async .delete_file(file: &FileHandle) -> Result<()>
 ```
 
 ### Chat Methods
@@ -755,6 +854,7 @@ async .delete_file(file: &FileHandle) -> Result<()>
 .with_model(model: impl Into<String>) -> Self
 .with_system_prompt(prompt: impl Into<String>) -> Self
 .with_requests_per_second(rps: f64) -> Self
+.with_max_function_calls(max: u32) -> Self
 
 // Access underlying agent
 .agent() -> &Agent
@@ -769,6 +869,11 @@ async .delete_file(file: &FileHandle) -> Result<()>
 .top_p(p: f32) -> Self                    // 0.0 - 1.0
 .retries(n: u32) -> Self
 .with_file(file: FileHandle) -> Self
+.with_tool<Args, F, Fut>(name: impl Into<String>, callback: F) -> Self
+    where Args: GeminiSchema + Deserialize + Send + 'static,
+          F: Fn(Args) -> Fut + Send + Sync + 'static,
+          Fut: Future<Output = Result<String>> + Send + 'static
+.with_max_function_calls(max: u32) -> Self
 
 // Execution (consumes builder)
 async .await -> Result<T>
@@ -826,9 +931,41 @@ struct Analysis {
     /// List of specific issues found, one per line
     issues: Vec<String>,
 }
+
+// Doc comments are especially important for tool arguments
+#[schema]
+struct WeatherArgs {
+    /// The city name, e.g., "San Francisco", "London", "Tokyo"
+    location: String,
+}
 ```
 
-### 5. Handle Errors Appropriately
+### 5. Keep Tool Callbacks Simple
+
+```rust
+// ✅ Good - simple, focused tool
+.with_tool("get_weather", |args: WeatherArgs| async move {
+    get_weather(&args.location).await
+})
+
+// ❌ Bad - complex logic in callback
+.with_tool("complex_tool", |args: ComplexArgs| async move {
+    let data1 = fetch_data1().await?;
+    let data2 = fetch_data2().await?;
+    let processed = process(data1, data2)?;
+    // ... many more lines
+    Ok(result)
+})
+
+// ✅ Better - extract to function
+async fn complex_tool_impl(args: ComplexArgs) -> Result<String> {
+    // Complex logic here
+}
+
+.with_tool("complex_tool", complex_tool_impl)
+```
+
+### 6. Handle Errors Appropriately
 
 ```rust
 // ✅ Good - specific error handling
@@ -844,11 +981,32 @@ match agent.prompt("Hello").await {
 let response = agent.prompt("Hello").await.unwrap_or_default();
 ```
 
+### 7. Configure Tool Limits Appropriately
+
+```rust
+// For simple tasks - low limit
+let response: String = agent
+    .prompt("What's 2+2?")
+    .with_tool("calculate", calculator_tool)
+    .with_max_function_calls(2)  // Only need 1-2 calls
+    .await?;
+
+// For complex workflows - higher limit
+let response: String = agent
+    .prompt("Research and summarize the latest AI news")
+    .with_tool("search", search_tool)
+    .with_tool("fetch_article", fetch_tool)
+    .with_max_function_calls(15)  // May need many calls
+    .await?;
+```
+
+---
+
 ## Examples
 
 Check the `examples/` directory for more:
 
-- `examples/ux.rs` - Comprehensive usage example
+- `examples/ux.rs` - Comprehensive usage example with tool calling
 - Run with: `cargo run --example ux`
 
 Named after the mythical giant **Adamastor** from Portuguese literature (_Os Lusíadas_ by Luís de Camões), who guards the Cape of Good Hope

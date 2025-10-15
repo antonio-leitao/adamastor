@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::any::TypeId;
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
@@ -104,6 +104,17 @@ impl<T: GeminiSchema> GeminiSchema for Option<T> {
         }
         schema
     }
+}
+
+// ============ Tool Calling ============
+
+type ToolExecutor =
+    Box<dyn Fn(Value) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync>;
+
+struct ToolDefinition {
+    name: String,
+    declaration: Value,
+    executor: ToolExecutor,
 }
 
 // ============ File Handling ============
@@ -240,6 +251,7 @@ pub struct Agent {
     system_prompt: Option<String>,
     client: reqwest::Client,
     rate_limiter: Arc<RateLimiter>,
+    max_function_calls: u32,
 }
 
 impl Agent {
@@ -251,6 +263,7 @@ impl Agent {
             system_prompt: None,
             client: reqwest::Client::new(),
             rate_limiter: Arc::new(RateLimiter::new(2.0)),
+            max_function_calls: 10,
         }
     }
 
@@ -277,6 +290,12 @@ impl Agent {
     /// Set rate limiting
     pub fn with_requests_per_second(mut self, rps: f64) -> Self {
         self.rate_limiter = Arc::new(RateLimiter::new(rps));
+        self
+    }
+
+    /// Set maximum function call iterations (default: 10)
+    pub fn with_max_function_calls(mut self, max: u32) -> Self {
+        self.max_function_calls = max;
         self
     }
 
@@ -367,12 +386,26 @@ struct Content {
 struct Part {
     text: Option<String>,
     file_data: Option<FileData>,
+    function_call: Option<FunctionCall>,
+    function_response: Option<FunctionResponse>,
 }
 
 #[derive(Debug, Clone)]
 struct FileData {
     mime_type: String,
     file_uri: String,
+}
+
+#[derive(Debug, Clone)]
+struct FunctionCall {
+    name: String,
+    args: Value,
+}
+
+#[derive(Debug, Clone)]
+struct FunctionResponse {
+    name: String,
+    response: Value,
 }
 
 /// Chat agent that maintains conversation history
@@ -408,6 +441,12 @@ impl Chat {
         self
     }
 
+    /// Set maximum function call iterations (default: 10)
+    pub fn with_max_function_calls(mut self, max: u32) -> Self {
+        self.agent = self.agent.with_max_function_calls(max);
+        self
+    }
+
     /// Get access to the underlying agent for file uploads
     pub fn agent(&self) -> &Agent {
         &self.agent
@@ -425,6 +464,8 @@ pub struct PromptBuilder<'a, T> {
     top_p: Option<f32>,
     retries: u32,
     files: Vec<FileHandle>,
+    tools: Vec<ToolDefinition>,
+    max_function_calls: Option<u32>,
     _phantom: PhantomData<T>,
 }
 
@@ -438,6 +479,8 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
             top_p: None,
             retries: 1,
             files: Vec::new(),
+            tools: Vec::new(),
+            max_function_calls: None,
             _phantom: PhantomData,
         }
     }
@@ -472,6 +515,45 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
         self
     }
 
+    /// Add a tool that the model can call
+    pub fn with_tool<Args, F, Fut>(mut self, name: impl Into<String>, callback: F) -> Self
+    where
+        Args: GeminiSchema + for<'de> Deserialize<'de> + Send + 'static,
+        F: Fn(Args) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String>> + Send + 'static,
+    {
+        let name = name.into();
+        let declaration = json!({
+            "name": name,
+            "description": format!("Tool: {}", name),
+            "parameters": Args::gemini_schema()
+        });
+
+        let callback = Arc::new(callback);
+        let executor: ToolExecutor = Box::new(move |args_json: Value| {
+            let callback = Arc::clone(&callback);
+            Box::pin(async move {
+                let args: Args = serde_json::from_value(args_json).map_err(|e| {
+                    AdamastorError::ParseError(format!("Failed to parse tool arguments: {}", e))
+                })?;
+                callback(args).await
+            })
+        });
+
+        self.tools.push(ToolDefinition {
+            name,
+            declaration,
+            executor,
+        });
+        self
+    }
+
+    /// Set maximum function call iterations (overrides agent default)
+    pub fn with_max_function_calls(mut self, max: u32) -> Self {
+        self.max_function_calls = Some(max);
+        self
+    }
+
     async fn execute(self) -> Result<T>
     where
         T: GeminiSchema + for<'de> Deserialize<'de>,
@@ -496,17 +578,8 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
     where
         T: GeminiSchema + for<'de> Deserialize<'de>,
     {
-        let request = self.build_request();
-        let response = self.agent.call_gemini(request).await?;
-        self.parse_response(response)
-    }
-
-    fn build_request(&self) -> Value
-    where
-        T: GeminiSchema,
-    {
+        // Build initial user message
         let mut parts = vec![json!({"text": self.prompt_text})];
-
         for file in &self.files {
             parts.push(json!({
                 "fileData": {
@@ -516,17 +589,128 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
             }));
         }
 
+        let mut contents = vec![json!({
+            "role": "user",
+            "parts": parts
+        })];
+
+        let max_iterations = self
+            .max_function_calls
+            .unwrap_or(self.agent.max_function_calls);
+
+        // Tool calling loop
+        for _iteration in 0..max_iterations {
+            let request = self.build_request(&contents);
+            let response = self.agent.call_gemini(request).await?;
+
+            // Check for function calls (plural - handle parallel calls)
+            let function_calls = self.extract_function_calls(&response)?;
+
+            if !function_calls.is_empty() {
+                // Add model's response (contains all function calls)
+                let model_content = response
+                    .get("candidates")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("content"))
+                    .ok_or_else(|| {
+                        AdamastorError::ParseError("Missing content in response".to_string())
+                    })?;
+                contents.push(model_content.clone());
+
+                // Execute all tools sequentially and collect responses
+                let mut response_parts = Vec::new();
+                for function_call in function_calls {
+                    // Find the tool
+                    let tool = self
+                        .tools
+                        .iter()
+                        .find(|t| t.name == function_call.name)
+                        .ok_or_else(|| {
+                            AdamastorError::Api(format!("Unknown tool: {}", function_call.name))
+                        })?;
+
+                    // Execute the tool
+                    let result = (tool.executor)(function_call.args.clone()).await?;
+
+                    // Add to response parts
+                    response_parts.push(json!({
+                        "functionResponse": {
+                            "name": function_call.name,
+                            "response": {"result": result}
+                        }
+                    }));
+                }
+
+                // Add all function responses in a single user turn
+                contents.push(json!({
+                    "role": "user",
+                    "parts": response_parts
+                }));
+
+                continue;
+            }
+
+            // No function calls - parse final response
+            return self.parse_response(response);
+        }
+
+        Err(AdamastorError::Api(
+            "Maximum function call iterations exceeded".to_string(),
+        ))
+    }
+
+    fn extract_function_calls(&self, response: &Value) -> Result<Vec<FunctionCall>> {
+        let parts = response
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array());
+
+        let mut function_calls = Vec::new();
+
+        if let Some(parts) = parts {
+            for part in parts {
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .ok_or_else(|| {
+                            AdamastorError::ParseError("Missing function name".to_string())
+                        })?
+                        .to_string();
+
+                    let args = fc.get("args").cloned().unwrap_or(json!({}));
+
+                    function_calls.push(FunctionCall { name, args });
+                }
+            }
+        }
+
+        Ok(function_calls)
+    }
+
+    fn build_request(&self, contents: &[Value]) -> Value
+    where
+        T: GeminiSchema,
+    {
         let mut request = json!({
-            "contents": [{
-                "role": "user",
-                "parts": parts
-            }]
+            "contents": contents
         });
 
         if let Some(system_prompt) = &self.agent.system_prompt {
             request["systemInstruction"] = json!({
                 "parts": [{"text": system_prompt}]
             });
+        }
+
+        // Add tools if present
+        if !self.tools.is_empty() {
+            request["tools"] = json!([{
+                "functionDeclarations": self.tools.iter()
+                    .map(|t| &t.declaration)
+                    .collect::<Vec<_>>()
+            }]);
         }
 
         let mut generation_config = json!({});
@@ -609,6 +793,8 @@ pub struct ChatPromptBuilder<'a, T> {
     top_p: Option<f32>,
     retries: u32,
     files: Vec<FileHandle>,
+    tools: Vec<ToolDefinition>,
+    max_function_calls: Option<u32>,
     _phantom: PhantomData<T>,
 }
 
@@ -622,6 +808,8 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
             top_p: None,
             retries: 1,
             files: Vec::new(),
+            tools: Vec::new(),
+            max_function_calls: None,
             _phantom: PhantomData,
         }
     }
@@ -656,6 +844,45 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
         self
     }
 
+    /// Add a tool that the model can call
+    pub fn with_tool<Args, F, Fut>(mut self, name: impl Into<String>, callback: F) -> Self
+    where
+        Args: GeminiSchema + for<'de> Deserialize<'de> + Send + 'static,
+        F: Fn(Args) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String>> + Send + 'static,
+    {
+        let name = name.into();
+        let declaration = json!({
+            "name": name,
+            "description": format!("Tool: {}", name),
+            "parameters": Args::gemini_schema()
+        });
+
+        let callback = Arc::new(callback);
+        let executor: ToolExecutor = Box::new(move |args_json: Value| {
+            let callback = Arc::clone(&callback);
+            Box::pin(async move {
+                let args: Args = serde_json::from_value(args_json).map_err(|e| {
+                    AdamastorError::ParseError(format!("Failed to parse tool arguments: {}", e))
+                })?;
+                callback(args).await
+            })
+        });
+
+        self.tools.push(ToolDefinition {
+            name,
+            declaration,
+            executor,
+        });
+        self
+    }
+
+    /// Set maximum function call iterations (overrides agent default)
+    pub fn with_max_function_calls(mut self, max: u32) -> Self {
+        self.max_function_calls = Some(max);
+        self
+    }
+
     async fn execute(mut self) -> Result<T>
     where
         T: GeminiSchema + for<'de> Deserialize<'de>,
@@ -684,6 +911,8 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
         let mut user_parts = vec![Part {
             text: Some(self.prompt_text.clone()),
             file_data: None,
+            function_call: None,
+            function_response: None,
         }];
 
         for file in &self.files {
@@ -693,6 +922,8 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
                     mime_type: file.mime_type.clone(),
                     file_uri: file.uri.clone(),
                 }),
+                function_call: None,
+                function_response: None,
             });
         }
 
@@ -701,23 +932,121 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
             parts: user_parts,
         });
 
-        // Build request with full history
-        let request = self.build_request();
-        let response = self.chat.agent.call_gemini(request).await?;
+        let max_iterations = self
+            .max_function_calls
+            .unwrap_or(self.chat.agent.max_function_calls);
 
-        // Parse response
-        let (result, response_text) = self.parse_response(response)?;
+        // Tool calling loop
+        for _iteration in 0..max_iterations {
+            let request = self.build_request();
+            let response = self.chat.agent.call_gemini(request).await?;
 
-        // Add model response to history
-        self.chat.history.push(Content {
-            role: "model".to_string(),
-            parts: vec![Part {
-                text: Some(response_text),
-                file_data: None,
-            }],
-        });
+            // Check for function calls (plural - handle parallel calls)
+            let function_calls = self.extract_function_calls(&response)?;
 
-        Ok(result)
+            if !function_calls.is_empty() {
+                // Add model's function calls to history
+                let mut model_parts = Vec::new();
+                for function_call in &function_calls {
+                    model_parts.push(Part {
+                        text: None,
+                        file_data: None,
+                        function_call: Some(function_call.clone()),
+                        function_response: None,
+                    });
+                }
+
+                self.chat.history.push(Content {
+                    role: "model".to_string(),
+                    parts: model_parts,
+                });
+
+                // Execute all tools sequentially and collect responses
+                let mut response_parts = Vec::new();
+                for function_call in function_calls {
+                    // Find the tool
+                    let tool = self
+                        .tools
+                        .iter()
+                        .find(|t| t.name == function_call.name)
+                        .ok_or_else(|| {
+                            AdamastorError::Api(format!("Unknown tool: {}", function_call.name))
+                        })?;
+
+                    // Execute the tool
+                    let result = (tool.executor)(function_call.args.clone()).await?;
+
+                    // Add to response parts
+                    response_parts.push(Part {
+                        text: None,
+                        file_data: None,
+                        function_call: None,
+                        function_response: Some(FunctionResponse {
+                            name: function_call.name.clone(),
+                            response: json!({"result": result}),
+                        }),
+                    });
+                }
+
+                // Add all function responses to history
+                self.chat.history.push(Content {
+                    role: "user".to_string(),
+                    parts: response_parts,
+                });
+
+                continue;
+            }
+
+            // No function calls - parse and add to history
+            let (result, response_text) = self.parse_response(response)?;
+
+            self.chat.history.push(Content {
+                role: "model".to_string(),
+                parts: vec![Part {
+                    text: Some(response_text),
+                    file_data: None,
+                    function_call: None,
+                    function_response: None,
+                }],
+            });
+
+            return Ok(result);
+        }
+
+        Err(AdamastorError::Api(
+            "Maximum function call iterations exceeded".to_string(),
+        ))
+    }
+
+    fn extract_function_calls(&self, response: &Value) -> Result<Vec<FunctionCall>> {
+        let parts = response
+            .get("candidates")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("parts"))
+            .and_then(|p| p.as_array());
+
+        let mut function_calls = Vec::new();
+
+        if let Some(parts) = parts {
+            for part in parts {
+                if let Some(fc) = part.get("functionCall") {
+                    let name = fc
+                        .get("name")
+                        .and_then(|n| n.as_str())
+                        .ok_or_else(|| {
+                            AdamastorError::ParseError("Missing function name".to_string())
+                        })?
+                        .to_string();
+
+                    let args = fc.get("args").cloned().unwrap_or(json!({}));
+
+                    function_calls.push(FunctionCall { name, args });
+                }
+            }
+        }
+
+        Ok(function_calls)
     }
 
     fn build_request(&self) -> Value
@@ -743,6 +1072,20 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
                                     "fileUri": file_data.file_uri
                                 }
                             })
+                        } else if let Some(function_call) = &part.function_call {
+                            json!({
+                                "functionCall": {
+                                    "name": function_call.name,
+                                    "args": function_call.args
+                                }
+                            })
+                        } else if let Some(function_response) = &part.function_response {
+                            json!({
+                                "functionResponse": {
+                                    "name": function_response.name,
+                                    "response": function_response.response
+                                }
+                            })
                         } else {
                             json!({"text": ""})
                         }
@@ -764,6 +1107,15 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
             request["systemInstruction"] = json!({
                 "parts": [{"text": system_prompt}]
             });
+        }
+
+        // Add tools if present
+        if !self.tools.is_empty() {
+            request["tools"] = json!([{
+                "functionDeclarations": self.tools.iter()
+                    .map(|t| &t.declaration)
+                    .collect::<Vec<_>>()
+            }]);
         }
 
         let mut generation_config = json!({});

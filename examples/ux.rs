@@ -1,4 +1,4 @@
-use adamastor::{Agent, Result, schema};
+use adamastor::{schema, Agent, Result};
 
 #[schema]
 struct Poem {
@@ -15,6 +15,26 @@ struct BookIdea {
     protagonist: String,
 }
 
+#[schema]
+struct WeatherArgs {
+    /// The city name, e.g., "Tokyo", "London", "San Francisco"
+    location: String,
+}
+
+#[schema]
+struct CalculatorArgs {
+    /// The mathematical expression to evaluate, e.g., "2 + 2", "sqrt(16)"
+    expression: String,
+}
+
+#[schema]
+struct TravelPlan {
+    destination: String,
+    activities: Vec<String>,
+    weather_info: String,
+    packing_recommendations: Vec<String>,
+}
+
 // A simple function to generate a prompt string
 fn translate_poem(poem: &Poem, language: &str) -> String {
     format!(
@@ -23,15 +43,48 @@ fn translate_poem(poem: &Poem, language: &str) -> String {
     )
 }
 
+// Mock weather API call
+async fn fetch_weather(location: &str) -> Result<String> {
+    // In a real app, you would call an actual weather API here
+    let weather_data = match location.to_lowercase().as_str() {
+        "tokyo" => "Sunny with clear skies, 22°C. Perfect weather for sightseeing!",
+        "london" => "Cloudy with occasional rain, 15°C. Bring an umbrella!",
+        "san francisco" => "Partly cloudy, 18°C. Mild and pleasant.",
+        "paris" => "Overcast with light drizzle, 16°C. Classic Parisian weather.",
+        _ => "Weather data unavailable for this location. Conditions are moderate.",
+    };
+
+    Ok(format!("Weather in {}: {}", location, weather_data))
+}
+
+// Mock calculator
+async fn calculate(expression: &str) -> Result<String> {
+    // In a real app, you might use a proper expression parser
+    let result = match expression {
+        "2 + 2" => "4",
+        "10 * 5" => "50",
+        "100 / 4" => "25",
+        _ => "Unable to calculate. Try a simpler expression.",
+    };
+
+    Ok(format!("Result: {}", result))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let api_key = std::env::var("GEMINI_KEY").expect("GEMINI_API_KEY environment variable not set");
+    let api_key = std::env::var("GEMINI_KEY").expect("GEMINI_KEY environment variable not set");
+
+    println!("ADAMASTOR - Comprehensive Example");
+    println!();
 
     // 1. AGENT SETUP: Configure the agent with global defaults.
     let agent = Agent::new(&api_key)
         .with_model("gemini-2.0-flash")
-        .with_system_prompt("You are a helpful and creative assistant specializing in literature.")
-        .with_requests_per_second(0.2);
+        .with_system_prompt(
+            "You are a helpful and creative assistant specializing in literature and travel.",
+        )
+        .with_requests_per_second(0.2)
+        .with_max_function_calls(10);
 
     // 2. STRUCTURED OUTPUT: Get a Poem struct, overriding the temperature for this request.
     println!("--- Generating a Poem ---");
@@ -50,7 +103,55 @@ async fn main() -> Result<()> {
 
     println!("{}\n", japanese_translation);
 
-    // 4. FILE HANDLING: Upload a file and use it in a prompt.
+    // 4. TOOL CALLING: Use a tool to fetch real-time weather data
+    println!("--- Using Tool Calling for Weather ---");
+    let weather_response: String = agent
+        .prompt("What's the weather like in Tokyo? Should I bring a jacket?")
+        .with_tool("get_weather", |args: WeatherArgs| async move {
+            fetch_weather(&args.location).await
+        })
+        .await?;
+
+    println!("{}\n", weather_response);
+
+    // 5. MULTIPLE TOOLS: Let the model choose which tool to use
+    println!("--- Multiple Tools Available ---");
+    let multi_tool_response: String = agent
+        .prompt("What's 10 times 5, and what's the weather in London?")
+        .with_tool("get_weather", |args: WeatherArgs| async move {
+            fetch_weather(&args.location).await
+        })
+        .with_tool("calculator", |args: CalculatorArgs| async move {
+            calculate(&args.expression).await
+        })
+        .with_max_function_calls(5)
+        .await?;
+
+    println!("{}\n", multi_tool_response);
+
+    // 6. STRUCTURED OUTPUT WITH TOOLS: Get structured data that uses tool results
+    println!("--- Structured Output Using Tools ---");
+    let travel_plan: TravelPlan = agent
+        .prompt("Create a weekend travel plan for Paris. Check the weather and suggest appropriate activities and packing items.")
+        .with_tool("get_weather", |args: WeatherArgs| async move {
+            fetch_weather(&args.location).await
+        })
+        .temperature(0.7)
+        .await?;
+
+    println!("Destination: {}", travel_plan.destination);
+    println!("Weather: {}", travel_plan.weather_info);
+    println!("Activities:");
+    for activity in &travel_plan.activities {
+        println!("  - {}", activity);
+    }
+    println!("Packing Recommendations:");
+    for item in &travel_plan.packing_recommendations {
+        println!("  - {}", item);
+    }
+    println!();
+
+    // 7. FILE HANDLING: Upload a file and use it in a prompt.
     // Note: Commented out since we need an actual file
     /*
     println!("--- Summarizing a Document ---");
@@ -65,7 +166,7 @@ async fn main() -> Result<()> {
     println!("{}\n", summary);
     */
 
-    // 5. CHAT: Maintain conversation history with a Chat object.
+    // 8. CHAT: Maintain conversation history with a Chat object.
     println!("--- Starting a Chat Session ---");
     let mut chat = Agent::chat(&api_key);
 
@@ -84,7 +185,29 @@ async fn main() -> Result<()> {
         .send("That's a fascinating concept. Can you write the first paragraph of the book?")
         .await?;
 
-    println!("Opening Paragraph:\n{}", follow_up);
+    println!("Opening Paragraph:\n{}\n", follow_up);
+
+    // 9. CHAT WITH TOOLS: Tools work in stateful conversations too
+    println!("--- Chat with Tool Calling ---");
+    let mut weather_chat =
+        Agent::chat(&api_key).with_system_prompt("You are a helpful travel assistant.");
+
+    let first_response: String = weather_chat
+        .send("I'm planning to visit San Francisco next week.")
+        .await?;
+
+    println!("Assistant: {}\n", first_response);
+
+    let weather_advice: String = weather_chat
+        .send("What's the weather like there? Should I pack warm clothes?")
+        .with_tool("get_weather", |args: WeatherArgs| async move {
+            fetch_weather(&args.location).await
+        })
+        .await?;
+
+    println!("Assistant: {}\n", weather_advice);
+
+    println!("All examples completed successfully!");
 
     Ok(())
 }
