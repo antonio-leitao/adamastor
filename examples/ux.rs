@@ -79,12 +79,29 @@ async fn main() -> Result<()> {
 
     // 1. AGENT SETUP: Configure the agent with global defaults.
     let agent = Agent::new(&api_key)
-        .with_model("gemini-2.0-flash")
+        .with_model("gemini-2.5-flash")
         .with_system_prompt(
             "You are a helpful and creative assistant specializing in literature and travel.",
         )
         .with_requests_per_second(0.2)
         .with_max_function_calls(10);
+
+    println!("--- Generating Text Embeddings ---");
+    let vector: Vec<f32> = agent
+        .encode("Adamastor is a powerful Rust framework for LLM agents.")
+        .as_query() // Optimized for retrieval
+        .dimensions(512) // Custom vector size
+        .await?;
+
+    println!("Single vector length: {}", vector.len());
+
+    let texts = vec![
+        "Rust is a systems programming language.".to_string(),
+        "Gemini is a large language model.".to_string(),
+    ];
+
+    let matrix: Vec<Vec<f32>> = agent.encode_batch(texts).await?;
+    println!("Batch matrix size: {}x{}\n", matrix.len(), matrix[0].len());
 
     // 2. STRUCTURED OUTPUT: Get a Poem struct, overriding the temperature for this request.
     println!("--- Generating a Poem ---");
@@ -166,7 +183,8 @@ async fn main() -> Result<()> {
     println!("{}\n", summary);
     */
 
-    // 8. CHAT: Maintain conversation history with a Chat object.
+    // 8. TEXT EMBEDDINGS: Convert text into numerical vectors for search or similarity.
+    // 9. CHAT: Maintain conversation history with a Chat object.
     println!("--- Starting a Chat Session ---");
     let mut chat = Agent::chat(&api_key);
 
@@ -187,7 +205,7 @@ async fn main() -> Result<()> {
 
     println!("Opening Paragraph:\n{}\n", follow_up);
 
-    // 9. CHAT WITH TOOLS: Tools work in stateful conversations too
+    // 10. CHAT WITH TOOLS: Tools work in stateful conversations too
     println!("--- Chat with Tool Calling ---");
     let mut weather_chat =
         Agent::chat(&api_key).with_system_prompt("You are a helpful travel assistant.");

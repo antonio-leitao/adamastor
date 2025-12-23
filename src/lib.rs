@@ -259,7 +259,7 @@ impl Agent {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
-            model: "gemini-2.0-flash".to_string(),
+            model: "gemini-2.5-flash".to_string(),
             system_prompt: None,
             client: reqwest::Client::new(),
             rate_limiter: Arc::new(RateLimiter::new(2.0)),
@@ -305,6 +305,16 @@ impl Agent {
         T: GeminiSchema + for<'de> Deserialize<'de> + Send + 'static,
     {
         PromptBuilder::new(self, text.into())
+    }
+
+    /// Create an encoding task for a single piece of text
+    pub fn encode(&self, text: impl Into<String>) -> EncodeBuilder<'_> {
+        EncodeBuilder::new(self, text.into())
+    }
+
+    /// Create an encoding task for a batch of text
+    pub fn encode_batch(&self, texts: Vec<String>) -> EncodeBatchBuilder<'_> {
+        EncodeBatchBuilder::new(self, texts)
     }
 
     /// Upload a file for use in prompts
@@ -370,6 +380,32 @@ impl Agent {
             return Err(AdamastorError::Api(error_text));
         }
 
+        Ok(response.json().await?)
+    }
+
+    async fn call_embed(&self, request: Value) -> Result<Value> {
+        self.rate_limiter.wait().await;
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={}",
+            self.api_key
+        );
+        let response = self.client.post(&url).json(&request).send().await?;
+        if !response.status().is_success() {
+            return Err(AdamastorError::Api(response.text().await?));
+        }
+        Ok(response.json().await?)
+    }
+
+    async fn call_batch_embed(&self, request: Value) -> Result<Value> {
+        self.rate_limiter.wait().await;
+        let url = format!(
+            "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key={}",
+            self.api_key
+        );
+        let response = self.client.post(&url).json(&request).send().await?;
+        if !response.status().is_success() {
+            return Err(AdamastorError::Api(response.text().await?));
+        }
         Ok(response.json().await?)
     }
 }
@@ -1183,5 +1219,166 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(self.execute())
+    }
+}
+
+// ============ EncodeBuilder ============
+
+/// Builder for configuring and executing a single embedding task
+pub struct EncodeBuilder<'a> {
+    agent: &'a Agent,
+    content: String,
+    task_type: Option<String>,
+    dimensions: Option<u32>,
+}
+
+impl<'a> EncodeBuilder<'a> {
+    fn new(agent: &'a Agent, content: String) -> Self {
+        Self {
+            agent,
+            content,
+            task_type: None,
+            dimensions: None,
+        }
+    }
+
+    pub fn as_semantic(mut self) -> Self {
+        self.task_type = Some("SEMANTIC_SIMILARITY".to_string());
+        self
+    }
+
+    pub fn as_query(mut self) -> Self {
+        self.task_type = Some("RETRIEVAL_QUERY".to_string());
+        self
+    }
+
+    pub fn as_document(mut self) -> Self {
+        self.task_type = Some("RETRIEVAL_DOCUMENT".to_string());
+        self
+    }
+
+    pub fn as_classification(mut self) -> Self {
+        self.task_type = Some("CLASSIFICATION".to_string());
+        self
+    }
+
+    pub fn dimensions(mut self, dims: u32) -> Self {
+        self.dimensions = Some(dims);
+        self
+    }
+}
+
+impl<'a> IntoFuture for EncodeBuilder<'a> {
+    type Output = Result<Vec<f32>>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let mut request = json!({
+                "model": "models/text-embedding-004",
+                "content": {
+                    "parts": [{"text": self.content}]
+                }
+            });
+
+            if let Some(tt) = self.task_type {
+                request["taskType"] = json!(tt);
+            }
+            if let Some(dim) = self.dimensions {
+                request["outputDimensionality"] = json!(dim);
+            }
+
+            let res = self.agent.call_embed(request).await?;
+            let values = res
+                .get("embedding")
+                .and_then(|e| e.get("values"))
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    AdamastorError::ParseError("Invalid embedding response".to_string())
+                })?;
+
+            let vec = values
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+            Ok(vec)
+        })
+    }
+}
+
+// ============ EncodeBatchBuilder ============
+
+/// Builder for configuring and executing batch embedding tasks
+pub struct EncodeBatchBuilder<'a> {
+    agent: &'a Agent,
+    contents: Vec<String>,
+    dimensions: Option<u32>,
+}
+
+impl<'a> EncodeBatchBuilder<'a> {
+    fn new(agent: &'a Agent, contents: Vec<String>) -> Self {
+        Self {
+            agent,
+            contents,
+            dimensions: None,
+        }
+    }
+
+    pub fn dimensions(mut self, dims: u32) -> Self {
+        self.dimensions = Some(dims);
+        self
+    }
+}
+
+impl<'a> IntoFuture for EncodeBatchBuilder<'a> {
+    type Output = Result<Vec<Vec<f32>>>;
+    type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let requests: Vec<Value> = self
+                .contents
+                .into_iter()
+                .map(|text| {
+                    let mut req = json!({
+                        "model": "models/text-embedding-004",
+                        "content": { "parts": [{"text": text}] }
+                    });
+                    if let Some(dim) = self.dimensions {
+                        req["outputDimensionality"] = json!(dim);
+                    }
+                    req
+                })
+                .collect();
+
+            let request = json!({ "requests": requests });
+            let res = self.agent.call_batch_embed(request).await?;
+
+            let embeddings = res
+                .get("embeddings")
+                .and_then(|e| e.as_array())
+                .ok_or_else(|| {
+                    AdamastorError::ParseError("Invalid batch embedding response".to_string())
+                })?;
+
+            let mut result = Vec::new();
+            for emb in embeddings {
+                let values = emb
+                    .get("values")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| {
+                        AdamastorError::ParseError("Invalid vector in batch response".to_string())
+                    })?;
+
+                result.push(
+                    values
+                        .iter()
+                        .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                        .collect(),
+                );
+            }
+
+            Ok(result)
+        })
     }
 }

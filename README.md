@@ -535,6 +535,74 @@ async fn main() -> Result<()> {
 
 ---
 
+## 11. Text Embeddings (Encoding)
+
+Convert text into numerical vectors for semantic search, clustering, or classification using `models/text-embedding-004`.
+
+### Single Encoding
+
+```rust
+use adamastor::{Agent, Result};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let agent = Agent::new(std::env::var("GEMINI_API_KEY")?);
+
+    // Default semantic embedding (768 dimensions)
+    let vector: Vec<f32> = agent
+        .encode("Adamastor is a Rust framework")
+        .await?;
+
+    // Specialized query embedding with custom dimensions
+    let query_vec: Vec<f32> = agent
+        .encode("What is Adamastor?")
+        .as_query()         // Optimized for retrieval
+        .dimensions(512)    // Truncate output vector
+        .await?;
+
+    println!("Vector length: {}", query_vec.len());
+    Ok(())
+}
+```
+
+### Batch Encoding
+
+For high-performance processing, use the batch API to encode multiple strings in a **single HTTP request**.
+
+```rust
+#[tokio::main]
+async fn main() -> Result<()> {
+    let agent = Agent::new(std::env::var("GEMINI_API_KEY")?);
+
+    let texts = vec![
+        "Rust is fast".to_string(),
+        "Python is easy".to_string(),
+        "Go is simple".to_string(),
+    ];
+
+    let matrix: Vec<Vec<f32>> = agent
+        .encode_batch(texts)
+        .dimensions(768)
+        .await?;
+
+    println!("Encoded {} strings", matrix.len());
+    Ok(())
+}
+```
+
+**Encoding Methods:**
+
+| Method                 | Description                                                  |
+| ---------------------- | ------------------------------------------------------------ |
+| `.as_query()`          | Optimized for the query side of a search (Short questions)   |
+| `.as_document()`       | Optimized for the document side of a search (Chunks of text) |
+| `.as_classification()` | Optimized for use as input to a classifier                   |
+| `.dimensions(u32)`     | Sets the output vector size (clipping). Defaults to 768.     |
+
+**Note:** Unlike prompts, the encoding API is hardcoded to use `text-embedding-004` to ensure the most modern and efficient vector representation.
+
+---
+
 ## Configuration
 
 ### Agent Configuration (Global Defaults)
@@ -600,6 +668,20 @@ let response: String = agent
 | `.with_max_function_calls(u32)` | `u32`        | Maximum tool call iterations                | `10`          |
 
 ---
+
+### EncodeBuilder / BatchEncodeBuilder Methods
+
+```rust
+// Configuration
+.as_query() -> Self
+.as_document() -> Self
+.as_classification() -> Self
+.dimensions(dims: u32) -> Self
+
+// Execution
+async .await -> Result<Vec<f32>>       // For EncodeBuilder
+async .await -> Result<Vec<Vec<f32>>> // For BatchEncodeBuilder
+```
 
 ## Working with Files (Multimodal)
 
@@ -834,6 +916,9 @@ Agent::chat(api_key: impl Into<String>) -> Chat
 .with_system_prompt(prompt: impl Into<String>) -> Self
 .with_requests_per_second(rps: f64) -> Self
 .with_max_function_calls(max: u32) -> Self
+.encode(text: impl Into<String>) -> EncodeBuilder<'_>
+.encode_batch(texts: Vec<String>) -> BatchEncodeBuilder<'_>
+
 
 // Prompt execution
 .prompt<T>(text: impl Into<String>) -> PromptBuilder<'_, T>
