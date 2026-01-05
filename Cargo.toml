@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "adamastor"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 license = "MIT"
 description = "Type-safe Rust framework for building LLM agents with structured outputs"
