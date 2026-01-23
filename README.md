@@ -35,7 +35,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-adamastor = "0.3.0"
+adamastor = "0.3.1"
 ```
 
 ## Quick Start
@@ -654,7 +654,8 @@ Override agent defaults for individual requests:
 ```rust
 let response: String = agent
     .prompt("Tell me a story")
-
+    // Model override
+    .with_model("gemini-2.5-pro")  // Override agent's default model
     // Generation parameters
     .temperature(0.9)          // Creativity (0.0 - 1.0, default: uses model default)
     .max_tokens(2048)          // Maximum response length (default: no limit)
@@ -1009,6 +1010,7 @@ async .upload_file(data: &[u8], mime_type: impl Into<String>) -> Result<FileHand
 
 ```rust
 // Configuration (chainable)
+.with_model(model: impl Into<String>) -> Self  // Override agent's model
 .temperature(temp: f32) -> Self           // 0.0 - 1.0
 .max_tokens(tokens: u32) -> Self
 .top_p(p: f32) -> Self                    // 0.0 - 1.0

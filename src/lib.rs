@@ -524,12 +524,14 @@ impl Agent {
         FileHandle::from_response(response_json, mime_type)
     }
 
-    async fn call_gemini(&self, request: Value) -> Result<Value> {
+    async fn call_gemini(&self, request: Value, model_override: Option<&str>) -> Result<Value> {
         self.rate_limiter.wait().await;
+
+        let model = model_override.unwrap_or(&self.model);
 
         let url = format!(
             "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
-            self.model
+            model
         );
 
         let response = self
@@ -662,6 +664,7 @@ pub struct PromptBuilder<'a, T> {
     agent: &'a Agent,
     prompt_text: String,
     temperature: Option<f32>,
+    model: Option<String>,
     max_tokens: Option<u32>,
     top_p: Option<f32>,
     retries: u32,
@@ -677,6 +680,7 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
             agent,
             prompt_text,
             temperature: None,
+            model: None,
             max_tokens: None,
             top_p: None,
             retries: 1,
@@ -692,7 +696,10 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
         self.temperature = Some(temp);
         self
     }
-
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
     /// Set the maximum number of tokens in the response
     pub fn max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = Some(tokens);
@@ -803,7 +810,10 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
         // Tool calling loop
         for _iteration in 0..max_iterations {
             let request = self.build_request(&contents);
-            let response = self.agent.call_gemini(request).await?;
+            let response = self
+                .agent
+                .call_gemini(request, self.model.as_deref())
+                .await?;
 
             // Check for function calls (plural - handle parallel calls)
             let function_calls = self.extract_function_calls(&response)?;
@@ -996,6 +1006,7 @@ pub struct ChatPromptBuilder<'a, T> {
     chat: &'a mut Chat,
     prompt_text: String,
     temperature: Option<f32>,
+    model: Option<String>,
     max_tokens: Option<u32>,
     top_p: Option<f32>,
     retries: u32,
@@ -1011,6 +1022,7 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
             chat,
             prompt_text,
             temperature: None,
+            model: None,
             max_tokens: None,
             top_p: None,
             retries: 1,
@@ -1024,6 +1036,12 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
     /// Set the temperature (0.0 to 1.0)
     pub fn temperature(mut self, temp: f32) -> Self {
         self.temperature = Some(temp);
+        self
+    }
+
+    /// Set the model for this specific prompt
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
         self
     }
 
@@ -1146,7 +1164,11 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
         // Tool calling loop
         for _iteration in 0..max_iterations {
             let request = self.build_request();
-            let response = self.chat.agent.call_gemini(request).await?;
+            let response = self
+                .chat
+                .agent
+                .call_gemini(request, self.model.as_deref())
+                .await?;
 
             // Check for function calls (plural - handle parallel calls)
             let function_calls = self.extract_function_calls(&response)?;
