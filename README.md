@@ -35,15 +35,17 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-adamastor = "0.2.0"
+adamastor = "0.3.0"
 ```
 
 ## Quick Start
 
 ```rust
-use adamastor::{Agent, schema, Result};
+use adamastor::{Agent, GeminiSchema, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Poem {
     title: String,
     content: String,
@@ -106,9 +108,11 @@ async fn main() -> Result<()> {
 Define a schema and let Rust infer the type:
 
 ```rust
-use adamastor::{Agent, schema, Result};
+use adamastor::{Agent, GeminiSchema, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Recipe {
     name: String,
     ingredients: Vec<String>,
@@ -145,9 +149,11 @@ async fn main() -> Result<()> {
 Create reusable prompt functions:
 
 ```rust
-use adamastor::{Agent, schema, Result};
+use adamastor::{Agent, GeminiSchema, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Recipe {
     name: String,
     ingredients: Vec<String>,
@@ -187,9 +193,11 @@ async fn main() -> Result<()> {
 Enable models to call your functions to access real-time data or perform actions:
 
 ```rust
-use adamastor::{Agent, schema, Result};
+use adamastor::{Agent, GeminiSchema, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct WeatherArgs {
     /// The city name, e.g., "Tokyo", "London"
     location: String,
@@ -240,12 +248,14 @@ async fn main() -> Result<()> {
 Models can chain multiple tool calls to accomplish complex tasks:
 
 ```rust
-use adamastor::{Agent, schema, Result};
+use adamastor::{Agent, GeminiSchema, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct LocationArgs {}
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct WeatherArgs {
     location: String,
 }
@@ -294,14 +304,16 @@ The model automatically:
 Combine tools with structured responses:
 
 ```rust
-use adamastor::{Agent, schema, Result};
+use adamastor::{Agent, GeminiSchema, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct WeatherArgs {
     location: String,
 }
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct TravelPlan {
     destination: String,
     activities: Vec<String>,
@@ -361,9 +373,11 @@ let poem = agent
 Use `Chat` for multi-turn conversations with automatic history management:
 
 ```rust
-use adamastor::{Agent, schema, Result};
+use adamastor::{Agent, GeminiSchema, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct BookIdea {
     title: String,
     logline: String,
@@ -416,9 +430,11 @@ async fn main() -> Result<()> {
 Tools work seamlessly with stateful conversations:
 
 ```rust
-use adamastor::{Agent, schema, Result};
+use adamastor::{Agent, GeminiSchema, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct WeatherArgs {
     location: String,
 }
@@ -462,22 +478,24 @@ async fn main() -> Result<()> {
 Chain prompts by passing outputs as inputs:
 
 ```rust
-use adamastor::{Agent, schema, Result};
+use adamastor::{Agent, GeminiSchema, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Article {
     title: String,
     content: String,
     word_count: u32,
 }
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Summary {
     main_points: Vec<String>,
     one_liner: String,
 }
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Quiz {
     questions: Vec<String>,
     difficulty: String,
@@ -740,12 +758,14 @@ let description: String = chat
 
 ## Schema Definition
 
-The `#[schema]` macro generates everything you need for type-safe structured outputs:
+Adamastor uses [schemars](https://docs.rs/schemars) for automatic JSON Schema generation. Simply derive `JsonSchema` along with serde traits:
 
 ```rust
-use adamastor::schema;
+use adamastor::GeminiSchema;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct BlogPost {
     /// The title of the blog post (doc comments become field descriptions!)
     title: String,
@@ -764,24 +784,26 @@ struct BlogPost {
 }
 ```
 
-**What `#[schema]` generates:**
+**What you get automatically:**
 
 - ✅ `Serialize` and `Deserialize` (serde)
-- ✅ `GeminiSchema` trait (converts to JSON Schema for API)
-- ✅ `Debug`, `Clone`, and `Default` traits
-- ✅ Converts doc comments to field descriptions in the schema
+- ✅ `GeminiSchema` trait (converts to Gemini-compatible JSON Schema)
+- ✅ Doc comments become field descriptions in the schema
+- ✅ `Option<T>` fields are correctly marked as nullable and NOT required
+- ✅ `propertyOrdering` ensures consistent JSON output from Gemini
+- ✅ Nested structs are fully supported with proper schema resolution
 
 ---
 
 ### Supported Types
 
-The `#[schema]` macro works with:
+The schema system works with:
 
 **Primitives:**
 
 - `String`
 - `bool`
-- `i32`, `i64`, `u32`, `u64`
+- `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`, `u64`, `isize`, `usize`
 - `f32`, `f64`
 
 **Collections:**
@@ -790,22 +812,40 @@ The `#[schema]` macro works with:
 
 **Optional:**
 
-- `Option<T>` where T is any supported type
+- `Option<T>` where T is any supported type (correctly excluded from `required`)
 
 **Nested:**
 
 ```rust
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Author {
     name: String,
     bio: String,
 }
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Article {
     title: String,
-    author: Author,        // ✅ Nested struct
+    author: Author,          // ✅ Nested struct
     co_authors: Vec<Author>, // ✅ Vec of structs
+}
+```
+
+**Enums:**
+
+```rust
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum Difficulty {
+    Easy,
+    Medium,
+    Hard,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct Challenge {
+    title: String,
+    difficulty: Difficulty,  // ✅ Enum with string variants
 }
 ```
 
@@ -813,12 +853,13 @@ struct Article {
 
 ### Tool Arguments
 
-Tool arguments use the same `#[schema]` macro:
+Tool arguments use the same derive pattern:
 
 ```rust
-use adamastor::schema;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct SearchArgs {
     /// The search query string
     query: String,
@@ -836,6 +877,25 @@ agent.prompt("Search for Rust tutorials")
         perform_search(&args.query, args.max_results).await
     })
 ```
+
+---
+
+### Inspecting Generated Schemas
+
+You can inspect the generated schema for debugging:
+
+```rust
+use adamastor::GeminiSchema;
+
+let schema = MyStruct::gemini_schema();
+println!("{}", serde_json::to_string_pretty(&schema).unwrap());
+```
+
+This will show you the exact JSON Schema sent to Gemini, including:
+
+- `properties` with types and descriptions
+- `required` array (excludes `Option<T>` fields)
+- `propertyOrdering` for consistent output
 
 ---
 
@@ -922,7 +982,7 @@ Agent::chat(api_key: impl Into<String>) -> Chat
 
 // Prompt execution
 .prompt<T>(text: impl Into<String>) -> PromptBuilder<'_, T>
-    where T: GeminiSchema + Deserialize + Send + 'static
+    where T: GeminiSchema + Send + 'static
 
 // File operations
 async .upload_file(data: &[u8], mime_type: impl Into<String>) -> Result<FileHandle>
@@ -933,7 +993,7 @@ async .upload_file(data: &[u8], mime_type: impl Into<String>) -> Result<FileHand
 ```rust
 // Sending messages
 .send<T>(text: impl Into<String>) -> ChatPromptBuilder<'_, T>
-    where T: GeminiSchema + Deserialize + Send + 'static
+    where T: GeminiSchema + Send + 'static
 
 // Configuration (same as Agent)
 .with_model(model: impl Into<String>) -> Self
@@ -955,13 +1015,32 @@ async .upload_file(data: &[u8], mime_type: impl Into<String>) -> Result<FileHand
 .retries(n: u32) -> Self
 .with_file(file: FileHandle) -> Self
 .with_tool<Args, F, Fut>(name: impl Into<String>, callback: F) -> Self
-    where Args: GeminiSchema + Deserialize + Send + 'static,
+    where Args: GeminiSchema + Send + 'static,
           F: Fn(Args) -> Fut + Send + Sync + 'static,
           Fut: Future<Output = Result<String>> + Send + 'static
 .with_max_function_calls(max: u32) -> Self
 
 // Execution (consumes builder)
 async .await -> Result<T>
+```
+
+### GeminiSchema Trait
+
+The `GeminiSchema` trait is automatically implemented for any type that implements `JsonSchema + Serialize + DeserializeOwned`:
+
+```rust
+use adamastor::GeminiSchema;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
+// This automatically gets GeminiSchema
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+struct MyType {
+    field: String,
+}
+
+// You can call gemini_schema() on any GeminiSchema type
+let schema = MyType::gemini_schema();
 ```
 
 ---
@@ -1008,7 +1087,7 @@ let follow_up: String = agent.prompt("What are its benefits?").await?; // No con
 
 ```rust
 // ✅ Good - helps the model understand what you want
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Analysis {
     /// A score from 0-100 indicating quality
     quality_score: u32,
@@ -1018,7 +1097,7 @@ struct Analysis {
 }
 
 // Doc comments are especially important for tool arguments
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct WeatherArgs {
     /// The city name, e.g., "San Francisco", "London", "Tokyo"
     location: String,
@@ -1091,7 +1170,10 @@ let response: String = agent
 
 Check the `examples/` directory for more:
 
-- `examples/ux.rs` - Comprehensive usage example with tool calling
-- Run with: `cargo run --example ux`
+- `examples/schema.rs` - Demonstrates schema generation and robustness features
+- `examples/ux.rs` - All usage
+- Run with: `cargo run --example <name>`
+
+---
 
 Named after the mythical giant **Adamastor** from Portuguese literature (_Os Lusíadas_ by Luís de Camões), who guards the Cape of Good Hope

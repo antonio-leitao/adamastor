@@ -1,6 +1,8 @@
-use adamastor::{schema, Agent, Result};
+use adamastor::{Agent, Result};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct Poem {
     title: String,
     content: String,
@@ -8,26 +10,26 @@ struct Poem {
     style: String,
 }
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct BookIdea {
     title: String,
     logline: String,
     protagonist: String,
 }
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct WeatherArgs {
     /// The city name, e.g., "Tokyo", "London", "San Francisco"
     location: String,
 }
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct CalculatorArgs {
     /// The mathematical expression to evaluate, e.g., "2 + 2", "sqrt(16)"
     expression: String,
 }
 
-#[schema]
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
 struct TravelPlan {
     destination: String,
     activities: Vec<String>,

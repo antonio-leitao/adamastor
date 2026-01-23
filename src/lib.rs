@@ -1,13 +1,12 @@
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use schemars::{schema_for, JsonSchema};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use std::any::TypeId;
 use std::future::{Future, IntoFuture};
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-pub use adamastor_macros::schema;
 
 // ============ Error Handling ============
 
@@ -33,76 +32,243 @@ pub type Result<T> = std::result::Result<T, AdamastorError>;
 
 // ============ GeminiSchema Trait ============
 
-/// Trait for types that can generate Gemini JSON schemas
-pub trait GeminiSchema {
-    fn gemini_schema() -> Value;
-}
-
-// String is special - it means unstructured text response
-impl GeminiSchema for String {
+/// Trait for types that can generate Gemini-compatible JSON schemas.
+/// Automatically implemented for any type that implements JsonSchema + Serialize + DeserializeOwned.
+pub trait GeminiSchema: JsonSchema + Serialize + DeserializeOwned {
+    /// Generate a Gemini-compatible JSON schema for this type.
     fn gemini_schema() -> Value {
-        json!({"type": "STRING"})
+        let schema = schema_for!(Self);
+        let value = serde_json::to_value(&schema).expect("Failed to serialize schema");
+        transform_schema_for_gemini(value)
     }
 }
 
-impl GeminiSchema for bool {
-    fn gemini_schema() -> Value {
-        json!({"type": "BOOLEAN"})
-    }
+// Blanket implementation - any type with the required traits gets GeminiSchema for free
+impl<T: JsonSchema + Serialize + DeserializeOwned> GeminiSchema for T {}
+
+// ============ Schema Transformation ============
+
+/// Transform a schemars-generated JSON Schema into Gemini-compatible format.
+/// This handles:
+/// - Resolving $ref references
+/// - Adding propertyOrdering to all objects
+/// - Removing unsupported fields ($schema, $id, definitions, etc.)
+/// - Handling allOf/anyOf patterns from schemars
+/// - Converting nullable types properly
+fn transform_schema_for_gemini(schema: Value) -> Value {
+    // First, resolve all $ref references by inlining definitions
+    let resolved = resolve_refs(&schema, &schema);
+
+    // Then transform the resolved schema for Gemini compatibility
+    transform_object_recursive(resolved)
 }
 
-impl GeminiSchema for i32 {
-    fn gemini_schema() -> Value {
-        json!({"type": "INTEGER", "format": "int32"})
-    }
-}
+/// Resolve $ref references by inlining them from definitions/$defs
+fn resolve_refs(node: &Value, root: &Value) -> Value {
+    match node {
+        Value::Object(map) => {
+            // Check if this is a $ref
+            if let Some(ref_value) = map.get("$ref") {
+                if let Some(ref_str) = ref_value.as_str() {
+                    // Parse the reference path (e.g., "#/definitions/MyType" or "#/$defs/MyType")
+                    if let Some(resolved) = resolve_ref_path(ref_str, root) {
+                        // Merge any local properties (like description) with the resolved reference
+                        let mut resolved = resolve_refs(&resolved, root);
+                        if let Value::Object(ref mut resolved_map) = resolved {
+                            for (key, value) in map {
+                                if key != "$ref" {
+                                    resolved_map.insert(key.clone(), resolve_refs(value, root));
+                                }
+                            }
+                        }
+                        return resolved;
+                    }
+                }
+            }
 
-impl GeminiSchema for i64 {
-    fn gemini_schema() -> Value {
-        json!({"type": "INTEGER", "format": "int64"})
-    }
-}
+            // Handle allOf - schemars uses this for references with additional properties
+            if let Some(all_of) = map.get("allOf") {
+                if let Some(all_of_array) = all_of.as_array() {
+                    if all_of_array.len() == 1 {
+                        // Single-item allOf - inline it and merge with local properties
+                        let mut resolved = resolve_refs(&all_of_array[0], root);
+                        if let Value::Object(ref mut resolved_map) = resolved {
+                            for (key, value) in map {
+                                if key != "allOf" {
+                                    resolved_map.insert(key.clone(), resolve_refs(value, root));
+                                }
+                            }
+                        }
+                        return resolved;
+                    } else {
+                        // Multi-item allOf - merge all items
+                        let mut merged = Map::new();
+                        for item in all_of_array {
+                            let resolved_item = resolve_refs(item, root);
+                            if let Value::Object(item_map) = resolved_item {
+                                merge_schema_objects(&mut merged, item_map);
+                            }
+                        }
+                        // Add any local properties
+                        for (key, value) in map {
+                            if key != "allOf" {
+                                merged.insert(key.clone(), resolve_refs(value, root));
+                            }
+                        }
+                        return Value::Object(merged);
+                    }
+                }
+            }
 
-impl GeminiSchema for u32 {
-    fn gemini_schema() -> Value {
-        json!({"type": "INTEGER", "format": "int32"})
-    }
-}
-
-impl GeminiSchema for u64 {
-    fn gemini_schema() -> Value {
-        json!({"type": "INTEGER", "format": "int64"})
-    }
-}
-
-impl GeminiSchema for f32 {
-    fn gemini_schema() -> Value {
-        json!({"type": "NUMBER", "format": "float"})
-    }
-}
-
-impl GeminiSchema for f64 {
-    fn gemini_schema() -> Value {
-        json!({"type": "NUMBER", "format": "double"})
-    }
-}
-
-impl<T: GeminiSchema> GeminiSchema for Vec<T> {
-    fn gemini_schema() -> Value {
-        json!({
-            "type": "ARRAY",
-            "items": T::gemini_schema()
-        })
-    }
-}
-
-impl<T: GeminiSchema> GeminiSchema for Option<T> {
-    fn gemini_schema() -> Value {
-        let mut schema = T::gemini_schema();
-        if let Some(obj) = schema.as_object_mut() {
-            obj.insert("nullable".to_string(), json!(true));
+            // Recursively resolve refs in all properties
+            let mut new_map = Map::new();
+            for (key, value) in map {
+                new_map.insert(key.clone(), resolve_refs(value, root));
+            }
+            Value::Object(new_map)
         }
-        schema
+        Value::Array(arr) => Value::Array(arr.iter().map(|v| resolve_refs(v, root)).collect()),
+        _ => node.clone(),
+    }
+}
+
+/// Parse a JSON pointer reference and return the resolved value
+fn resolve_ref_path(ref_str: &str, root: &Value) -> Option<Value> {
+    // Handle both "#/definitions/Type" and "#/$defs/Type"
+    let path = ref_str.strip_prefix("#/")?;
+    let parts: Vec<&str> = path.split('/').collect();
+
+    let mut current = root;
+    for part in parts {
+        current = current.get(part)?;
+    }
+    Some(current.clone())
+}
+
+/// Merge two schema objects, combining properties and required arrays
+fn merge_schema_objects(target: &mut Map<String, Value>, source: Map<String, Value>) {
+    for (key, value) in source {
+        match key.as_str() {
+            "properties" => {
+                let target_props = target.entry("properties").or_insert_with(|| json!({}));
+                if let (Some(target_obj), Some(source_obj)) =
+                    (target_props.as_object_mut(), value.as_object())
+                {
+                    for (k, v) in source_obj {
+                        target_obj.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+            "required" => {
+                let target_req = target.entry("required").or_insert_with(|| json!([]));
+                if let (Some(target_arr), Some(source_arr)) =
+                    (target_req.as_array_mut(), value.as_array())
+                {
+                    for item in source_arr {
+                        if !target_arr.contains(item) {
+                            target_arr.push(item.clone());
+                        }
+                    }
+                }
+            }
+            _ => {
+                target.insert(key, value);
+            }
+        }
+    }
+}
+
+/// Recursively transform a schema object for Gemini compatibility
+fn transform_object_recursive(node: Value) -> Value {
+    match node {
+        Value::Object(mut map) => {
+            // Remove unsupported fields (same list as original implementation)
+            let unsupported = [
+                "$schema",
+                "$id",
+                "definitions",
+                "$defs",
+                "examples",
+                "default",
+                "const",
+                "if",
+                "then",
+                "else",
+                "oneOf",
+                "not",
+                "deprecated",
+                "readOnly",
+                "writeOnly",
+            ];
+            for field in unsupported {
+                map.remove(field);
+            }
+            for field in unsupported {
+                map.remove(field);
+            }
+
+            // Handle anyOf with null (Option<T> pattern)
+            if let Some(any_of) = map.remove("anyOf") {
+                if let Some(any_of_array) = any_of.as_array() {
+                    let non_null: Vec<&Value> = any_of_array
+                        .iter()
+                        .filter(|v| v.get("type") != Some(&json!("null")))
+                        .collect();
+
+                    if non_null.len() == 1 {
+                        // Option<T> pattern - merge the inner type and mark nullable
+                        let mut inner = transform_object_recursive(non_null[0].clone());
+                        if let Some(inner_obj) = inner.as_object_mut() {
+                            inner_obj.insert("nullable".to_string(), json!(true));
+                            return Value::Object(inner_obj.clone());
+                        }
+                    }
+                }
+            }
+
+            // Handle type arrays like ["string", "null"] -> nullable
+            if let Some(type_val) = map.get("type").cloned() {
+                if let Some(type_array) = type_val.as_array() {
+                    let non_null_types: Vec<&Value> = type_array
+                        .iter()
+                        .filter(|t| t.as_str() != Some("null"))
+                        .collect();
+
+                    if non_null_types.len() == 1 {
+                        map.insert("type".to_string(), non_null_types[0].clone());
+                        map.insert("nullable".to_string(), json!(true));
+                    }
+                }
+            }
+
+            // Add propertyOrdering for objects with properties
+            if map.get("type") == Some(&json!("object")) || map.contains_key("properties") {
+                if let Some(props) = map.get("properties") {
+                    if let Some(props_obj) = props.as_object() {
+                        let mut ordering: Vec<String> = props_obj.keys().cloned().collect();
+                        ordering.sort(); // Consistent alphabetical ordering
+                        map.insert("propertyOrdering".to_string(), json!(ordering));
+                    }
+                }
+
+                // Ensure type is set
+                if !map.contains_key("type") {
+                    map.insert("type".to_string(), json!("object"));
+                }
+            }
+
+            // Recursively transform nested values
+            let mut transformed = Map::new();
+            for (key, value) in map {
+                transformed.insert(key, transform_object_recursive(value));
+            }
+
+            Value::Object(transformed)
+        }
+        Value::Array(arr) => {
+            Value::Array(arr.into_iter().map(transform_object_recursive).collect())
+        }
+        _ => node,
     }
 }
 
@@ -302,7 +468,7 @@ impl Agent {
     /// Create a prompt - returns a builder that can be configured and awaited
     pub fn prompt<T>(&self, text: impl Into<String>) -> PromptBuilder<'_, T>
     where
-        T: GeminiSchema + for<'de> Deserialize<'de> + Send + 'static,
+        T: GeminiSchema + Send + 'static,
     {
         PromptBuilder::new(self, text.into())
     }
@@ -454,7 +620,7 @@ impl Chat {
     /// Send a message in the conversation - returns a builder that can be configured and awaited
     pub fn send<T>(&mut self, text: impl Into<String>) -> ChatPromptBuilder<'_, T>
     where
-        T: GeminiSchema + for<'de> Deserialize<'de> + Send + 'static,
+        T: GeminiSchema + Send + 'static,
     {
         ChatPromptBuilder::new(self, text.into())
     }
@@ -554,7 +720,7 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
     /// Add a tool that the model can call
     pub fn with_tool<Args, F, Fut>(mut self, name: impl Into<String>, callback: F) -> Self
     where
-        Args: GeminiSchema + for<'de> Deserialize<'de> + Send + 'static,
+        Args: GeminiSchema + Send + 'static,
         F: Fn(Args) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<String>> + Send + 'static,
     {
@@ -592,7 +758,7 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
 
     async fn execute(self) -> Result<T>
     where
-        T: GeminiSchema + for<'de> Deserialize<'de>,
+        T: GeminiSchema,
     {
         let mut last_error = None;
 
@@ -612,7 +778,7 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
 
     async fn execute_once(&self) -> Result<T>
     where
-        T: GeminiSchema + for<'de> Deserialize<'de>,
+        T: GeminiSchema,
     {
         // Build initial user message
         let mut parts = vec![json!({"text": self.prompt_text})];
@@ -776,7 +942,7 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
 
     fn parse_response(&self, response: Value) -> Result<T>
     where
-        T: for<'de> Deserialize<'de>,
+        T: GeminiSchema,
     {
         let text = response
             .get("candidates")
@@ -786,7 +952,12 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
             .and_then(|p| p.get(0))
             .and_then(|p| p.get("text"))
             .and_then(|t| t.as_str())
-            .ok_or_else(|| AdamastorError::ParseError("Missing text in response".to_string()))?;
+            .ok_or_else(|| {
+                AdamastorError::ParseError(format!(
+                    "Missing text in response. Full response: {}",
+                    serde_json::to_string(&response).unwrap_or_default()
+                ))
+            })?;
 
         // If T is String, just return the text directly
         if TypeId::of::<T>() == TypeId::of::<String>() {
@@ -795,11 +966,11 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
             std::mem::forget(text.to_string());
             Ok(result)
         } else {
-            // Otherwise parse as JSON
+            // Otherwise parse as JSON - include raw response in error for debugging
             serde_json::from_str(text).map_err(|e| {
                 AdamastorError::ParseError(format!(
-                    "Failed to parse response into target schema: {}",
-                    e
+                    "Failed to parse response into target schema: {}. Raw response: {}",
+                    e, text
                 ))
             })
         }
@@ -808,7 +979,7 @@ impl<'a, T: 'static> PromptBuilder<'a, T> {
 
 impl<'a, T> IntoFuture for PromptBuilder<'a, T>
 where
-    T: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
+    T: GeminiSchema + Send + Sync + 'static,
 {
     type Output = Result<T>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
@@ -883,7 +1054,7 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
     /// Add a tool that the model can call
     pub fn with_tool<Args, F, Fut>(mut self, name: impl Into<String>, callback: F) -> Self
     where
-        Args: GeminiSchema + for<'de> Deserialize<'de> + Send + 'static,
+        Args: GeminiSchema + Send + 'static,
         F: Fn(Args) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<String>> + Send + 'static,
     {
@@ -921,7 +1092,7 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
 
     async fn execute(mut self) -> Result<T>
     where
-        T: GeminiSchema + for<'de> Deserialize<'de>,
+        T: GeminiSchema,
     {
         let mut last_error = None;
 
@@ -941,7 +1112,7 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
 
     async fn execute_once(&mut self) -> Result<T>
     where
-        T: GeminiSchema + for<'de> Deserialize<'de>,
+        T: GeminiSchema,
     {
         // Add user message to history
         let mut user_parts = vec![Part {
@@ -1180,7 +1351,7 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
 
     fn parse_response(&self, response: Value) -> Result<(T, String)>
     where
-        T: for<'de> Deserialize<'de>,
+        T: GeminiSchema,
     {
         let text = response
             .get("candidates")
@@ -1190,7 +1361,12 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
             .and_then(|p| p.get(0))
             .and_then(|p| p.get("text"))
             .and_then(|t| t.as_str())
-            .ok_or_else(|| AdamastorError::ParseError("Missing text in response".to_string()))?;
+            .ok_or_else(|| {
+                AdamastorError::ParseError(format!(
+                    "Missing text in response. Full response: {}",
+                    serde_json::to_string(&response).unwrap_or_default()
+                ))
+            })?;
 
         let parsed = if TypeId::of::<T>() == TypeId::of::<String>() {
             // Safe because we checked the type
@@ -1200,8 +1376,8 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
         } else {
             serde_json::from_str(text).map_err(|e| {
                 AdamastorError::ParseError(format!(
-                    "Failed to parse response into target schema: {}",
-                    e
+                    "Failed to parse response into target schema: {}. Raw response: {}",
+                    e, text
                 ))
             })?
         };
@@ -1212,7 +1388,7 @@ impl<'a, T: 'static> ChatPromptBuilder<'a, T> {
 
 impl<'a, T> IntoFuture for ChatPromptBuilder<'a, T>
 where
-    T: GeminiSchema + for<'de> Deserialize<'de> + Send + Sync + 'static,
+    T: GeminiSchema + Send + Sync + 'static,
 {
     type Output = Result<T>;
     type IntoFuture = Pin<Box<dyn Future<Output = Self::Output> + Send + 'a>>;
@@ -1380,5 +1556,105 @@ impl<'a> IntoFuture for EncodeBatchBuilder<'a> {
 
             Ok(result)
         })
+    }
+}
+
+// ============ Unit Tests ============
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct SimpleStruct {
+        name: String,
+        count: i32,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct WithOptional {
+        required_field: String,
+        optional_field: Option<String>,
+    }
+
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct Nested {
+        inner: SimpleStruct,
+        items: Vec<String>,
+    }
+
+    #[test]
+    fn test_simple_schema_has_property_ordering() {
+        let schema = SimpleStruct::gemini_schema();
+        assert!(schema.get("propertyOrdering").is_some());
+        assert!(schema.get("$schema").is_none());
+    }
+
+    #[test]
+    fn test_optional_not_in_required() {
+        let schema = WithOptional::gemini_schema();
+        let required = schema.get("required").unwrap().as_array().unwrap();
+
+        // required_field should be in required
+        assert!(required.iter().any(|v| v == "required_field"));
+
+        // optional_field should NOT be in required
+        assert!(!required.iter().any(|v| v == "optional_field"));
+
+        // optional_field should have nullable: true
+        let props = schema.get("properties").unwrap();
+        let opt_field = props.get("optional_field").unwrap();
+        assert_eq!(opt_field.get("nullable"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn test_nested_has_property_ordering() {
+        let schema = Nested::gemini_schema();
+
+        // Top level has propertyOrdering
+        assert!(schema.get("propertyOrdering").is_some());
+
+        // Nested inner object also has propertyOrdering
+        let props = schema.get("properties").unwrap();
+        let inner = props.get("inner").unwrap();
+        assert!(inner.get("propertyOrdering").is_some());
+    }
+
+    #[test]
+    fn test_no_unsupported_fields() {
+        let schema = SimpleStruct::gemini_schema();
+        let schema_str = serde_json::to_string(&schema).unwrap();
+
+        assert!(!schema_str.contains("$schema"));
+        assert!(!schema_str.contains("$id"));
+        assert!(!schema_str.contains("definitions"));
+        assert!(!schema_str.contains("$defs"));
+    }
+
+    // Test that properties named "title" are preserved
+    #[derive(Debug, Serialize, Deserialize, JsonSchema)]
+    struct WithTitleProperty {
+        title: String,
+        content: String,
+    }
+
+    #[test]
+    fn test_title_property_preserved() {
+        let schema = WithTitleProperty::gemini_schema();
+
+        // The property "title" should exist in properties
+        let props = schema.get("properties").unwrap();
+        assert!(
+            props.get("title").is_some(),
+            "Property 'title' should be preserved"
+        );
+
+        // Should be in required
+        let required = schema.get("required").unwrap().as_array().unwrap();
+        assert!(required.iter().any(|v| v == "title"));
+
+        // Should be in propertyOrdering
+        let ordering = schema.get("propertyOrdering").unwrap().as_array().unwrap();
+        assert!(ordering.iter().any(|v| v == "title"));
     }
 }
