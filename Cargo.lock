@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adamastor"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "indexmap",
  "reqwest",
@@ -16,15 +16,6 @@ dependencies = [
  "tokio-test",
  "url",
  "uuid",
-]
-
-[[package]]
-name = "adamastor-macros"
-version = "0.2.5"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
